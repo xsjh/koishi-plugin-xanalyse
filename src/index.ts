@@ -18,20 +18,32 @@ export function apply(ctx: Context) {
         if (url == ''){
         await session.send("您输入的url为空");
       }else{
+        // 拼接推文url
         const tweetContent = await getTweetContent(ctx.puppeteer, url);
-        console.log("获取的图片url", tweetContent.imgUrls);
+        const baseUrl = 'https://nitter.net';
+        const fullImgUrls = tweetContent.imgUrls.map(src => `${baseUrl}${src}`);
+        // 请求图片并发送
+        const imagePromises = fullImgUrls.map(async (imageUrl) => {
+          try {
+            const response = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
+            return h.image(response, 'image/jpeg'); // 根据图片格式调整 MIME 类型
+          } catch (error) {
+            console.error(`请求图片失败: ${imageUrl}`, error);
+            return null;
+          }
+        });
+        const images = (await Promise.all(imagePromises)).filter((img) => img !== null);// 过滤掉请求失败的
         const msg = `获取成功：
 ${tweetContent.word_content}
-${h.image(tweetContent.buffer)}       
-          `
+${h.image(tweetContent.buffer)}
+${images.join('\n')}
+        `;
         await session.send(msg);
-        
       }
       } catch (error) {
-        console.log("获取推文过程失败");
+        console.log("获取推文过程失败", error);
       }
     });
-
 }
 
 async function getTweetContent(pptr,url) {
@@ -57,11 +69,17 @@ async function getTweetContent(pptr,url) {
     
     // 3、获取推文图片
     const imgUrls = await page.evaluate(() => {
-      const imgelement = document.querySelector('div.gallery-row');
-      if (!imgelement) return [];
-      
-      
-      
+      const firstTimelineItem = document.querySelector('div.gallery-row');
+      if (!firstTimelineItem) return [];
+      const imgElements = firstTimelineItem.querySelectorAll('img');
+      const srcs = [];
+      for (const imgElement of imgElements) {
+        const src = imgElement.getAttribute('src');
+        if (src) {
+          srcs.push(src);
+        }
+      }
+      return srcs;
     });
     // 返回图片与文字
     return {
