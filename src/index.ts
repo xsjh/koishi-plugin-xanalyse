@@ -34,7 +34,7 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>0.0.1</p>
+<p>0.0.2</p>
 <ul>
 <li>完成了基本功能，健壮性仍待加强</li>
 </ul>
