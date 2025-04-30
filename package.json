@@ -9,6 +9,11 @@
     "dist"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xsjh/koishi-plugin-xanalyse"
+  },
+  "homepage": "https://github.com/xsjh/koishi-plugin-xanalyse",
   "keywords": [
     "chatbot",
     "koishi",
