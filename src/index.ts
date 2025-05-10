@@ -7,12 +7,12 @@ export const name = 'xanalyse'
 
 export const logger = new Logger('xanalyse');
 
-export const inject = {required:["puppeteer"]};
+export const inject = {required:["puppeteer","database"]};
 
 export const usage = `
 <h1>X推送</h1>
 <p><b>全程需✨🧙‍♂️，请在proxy-agent内配置代理</b></p>
-<p>跟随系统代理方式：在proxy-agent代理服务器地址填写<code>http://127.0.0.1:7890</code></p>
+<p><b>跟随系统代理方式：</b>在proxy-agent代理服务器地址填写<code>http://127.0.0.1:7890</code></p>
 <p>数据来源于 <a href="https://nitter.net/" target="_blank">nitter.net</a></p>
 <hr>
 <h2>Tutorials</h2>
@@ -26,7 +26,9 @@ export const usage = `
 <p><b>tt:</b></p>
 <ul>
 <p> · 发送<code>tt</code>后会自动检查一遍当前订阅的博主的最新推文（实验性）</p>
+<br>
 </ul>
+<p><b>📢注意：因为本插件基于镜像站，在填写完博主用户名后若初始化失败，请打开日志调试模式，手动点击生成的博主链接，查看是否正确引导至博主页面。若有误则可能因为博主id填写有误，请修改</b></p>
 <hr>
 <h3>Notice</h3>
 <p>Onebot 适配器下，偶尔发不出来图，Koishi 报错日志为 <code>retcode:1200</code> 时，请查看协议端日志自行解决！</p>
@@ -34,9 +36,10 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>0.0.2</p>
+<p>1.0.0</p>
 <ul>
-<li>完成了基本功能，健壮性仍待加强</li>
+<li>实现数据持久化，现在重启插件不会导致刷屏</li>
+<li>实现多群推送功能，现在一个博主的推文可以推送至多个群聊</li>
 </ul>
 </div>
 <hr>
@@ -55,7 +58,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     account: Schema.string().required().description('机器人账号'),
     platform: Schema.string().required().description('机器人平台，例如onebot'),
-    updateInterval: Schema.number().min(1).default(5).description('检查推文更新间隔时间，建议每增加一个订阅增加30s')
+    updateInterval: Schema.number().min(1).default(5).description('检查推文更新间隔时间（单位分钟），建议每多两个订阅增加1分钟')
   }).description('基础设置'),
   
   Schema.object({
@@ -71,148 +74,53 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     bloggers: Schema.array(Schema.object({
-      id: Schema.string().description('Twitter博主用户名'),
-      groupID: Schema.string().description('需要推送的群号'),    
-    })).description('订阅的博主列表'),
+      id: Schema.string().description('Twitter博主用户名, 输@之后的用户名即可，不要加上@'),
+      groupID: Schema.array(String).role('table').description('需要推送的群号'),    
+    })).description('订阅的博主列表，例：elonmusk'),
   }).description('订阅的博主列表'),
   Schema.object({
     outputLogs: Schema.boolean().default(true).description('日志调试模式，开启以获得更多信息').experimental(),
   }).description('调试设置'),
 ]);
 
+//声明数据表
+declare module 'koishi' {
+  interface Tables {
+    xanalyse: Xanalyse
+  }
+}
+//表的接口类型
+export interface Xanalyse {
+  id: string,
+  link: string
+}
 
 
 export async function apply(ctx: Context, config, session) {
+  // 创建数据库
+  try {
+    ctx.database.extend('xanalyse',{
+      id: 'string',
+      link: 'string'
+    })
+    logger.info('数据库初始化成功')
+  } catch (error) {
+    logger.error('数据库初始化失败', error)
+  }
 
-  
+  // 先初始化数据库，把每个博主的最新链接存储进link列
+  await init(config,ctx);
 
-  // 初始化数组，用于存储每个博主的最新推文链接
-  let sentTweetUrls: { id: string; link: string | null }[] = config.bloggers.map(blogger => ({
-    id: blogger.id,
-    link: null
-  }));
-  
-
-  // 定时推送功能
-  ctx.setInterval(async () => {
-    try {
-      // 遍历博主id并挨个请求最新推文url
-      const baseUrl = 'https://nitter.net'; // 替换为实际的 Nitter 镜像站地址
-      for (const blogger of config.bloggers) {
-        const { id, groupID } = blogger;
-        const bloggerUrl = `${baseUrl}/${id}`;
-        const timenow = await getTimeNow();
-        if (config.outputLogs) {
-          logger.info('当前时间：', timenow, '本次请求的博主与链接：', id, bloggerUrl);
-        }
-        console.log('当前时间：', timenow, '本次请求的博主与链接：', id, bloggerUrl);
-  
-        try {
-          const latestTweets = await getLatestTweets(ctx.puppeteer, bloggerUrl, config);
-          if (config.outputLogs) {
-            logger.info('主函数返回的推文信息：', latestTweets);
-          }
-          console.log('主函数返回的推文信息：', latestTweets);
-  
-          // 检查url是否获取成功
-          if (latestTweets.length > 0) {
-            const latestTweetLink = latestTweets[0].link;
-            // 检查是否已经发送过该推文
-            console.log('当前已存储推文历史：', sentTweetUrls);
-            const existingTweet = sentTweetUrls.find(item => item.id === id);
-  
-            if (existingTweet && existingTweet.link !== latestTweetLink) { // 未发送的情况
-              existingTweet.link = latestTweetLink; // 更新链接
-              const isRetweet = latestTweets[0].isRetweet;
-              const url = `${baseUrl}${latestTweetLink}`;
-              console.log('拼接后的推文url：', url);
-              if (config.outputLogs) {
-                logger.info('拼接后的推文url：', url);
-              }
-  
-              // 获得推文具体内容
-              const tpTweet = await getTimePushedTweet(ctx.puppeteer, url);
-              if (config.outputLogs) {
-                logger.info(`
-                  推文文字：${tpTweet.word_content}
-                `);
-              }
-              console.log(`
-                推文文字：${tpTweet.word_content}
-              `);
-
-              // 请求图片url
-              const fullImgUrls = tpTweet.imgUrls.map(src => `${baseUrl}${src}`);
-              const imagePromises = fullImgUrls.map(async (imageUrl) => {
-                let attempts = 0;
-                const maxRetries = 3;
-                while (attempts < maxRetries) {
-                  try {
-                    const response = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
-                    return h.image(response, 'image/webp'); // 根据图片格式调整 MIME 类型
-                  } catch (error) {
-                    attempts++;
-                    logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                    console.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                    if (attempts >= maxRetries) {
-                      logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                      console.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                      return null;
-                    }
-                  }
-                }
-              });
-              const images = (await Promise.all(imagePromises)).filter((img) => img !== null); // 过滤掉请求失败的图片
-              
-              // 根据config决定是否翻译推文
-              let tweetWord;
-              if (config.whe_translate === true && config.apiKey){
-                const translation = await translate(tpTweet.word_content , ctx, config);
-                console.log('翻译结果',translation);
-                tweetWord = translation;
-              }else{
-                tweetWord = tpTweet.word_content;
-              }
-              
-              // 构造消息内容并发送
-              let msg = `【${id}】 发布了一条推文：\n${tweetWord}\n`;
-              if (isRetweet) {
-                msg += "[提醒：这是一条转发推文]\n";
-              }
-              msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
-              msg += `${images.join('\n')}\n
-              链接：${url}`;
-              const botKey = `${config.platform}:${config.account}`;
-              await ctx.bots[botKey].sendMessage(groupID, msg);
-            } else {
-              if (config.outputLogs) {
-                logger.info(`已发送过博主 ${id} 的最新推文，跳过`);
-              }
-              console.log(`已发送过博主 ${id} 的最新推文，跳过`);
-            }
-          }
-        } catch (error) {
-          // 如果当前博主处理出错，记录日志并跳过当前博主
-          logger.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl}`, error);
-          console.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl}`, error);
-          await session.send(`加载博主 ${id} 的页面时出错，可能是网络问题或链接不合法。请检查链接的合法性或稍后重试。`);
-        }
-      }
-    } catch (error) {
-      logger.error('主函数错误：', error);
-      console.error('主函数错误：', error);
-      await session.send('获取推文时出错，请检查网页链接的合法性或稍后重试。');
-    }
-  }, config.updateInterval * 60 * 1000);
+  // 定时推送
+  ctx.setInterval(async () => 
+   {checkTweets(session, config, ctx)}, config.updateInterval * 60 * 1000);
  
   
-  
 
-  
   ctx.command('tt','主动检查一次推文更新')
     .action(async ({session}) => {
       await session.send("正在检查更新...");
-      await checkTweets(session, config, ctx, sentTweetUrls);
+      await checkTweets(session, config, ctx);
       // const is_imgurl = await getTimePushedTweet(ctx.puppeteer,'https://nitter.net/SECNAV/status/1917191078677299333');
       // console.log('是否存在url', is_imgurl.imgUrls);
     });
@@ -297,8 +205,6 @@ async function getTimePushedTweet(pptr, url, maxRetries = 3) {// 获得推文具
         }
         return srcs;
       });
-      
-
       await page.close();
       return {
         word_content,
@@ -373,10 +279,10 @@ async function getLatestTweets(pptr, url, config, maxRetries = 3) {// 获得订�
   }
 }
 
-async function checkTweets(session, config, ctx, sentTweetUrls) {// 手动更新一次推文
+async function checkTweets(session, config, ctx) {// 更新一次推文
   try {
     // 遍历博主id并挨个请求最新推文url
-    const baseUrl = 'https://nitter.net'; // 替换为实际的 Nitter 镜像站地址
+    const baseUrl = 'https://nitter.net';
     for (const blogger of config.bloggers) {
       const { id, groupID } = blogger;
       const bloggerUrl = `${baseUrl}/${id}`;
@@ -384,27 +290,28 @@ async function checkTweets(session, config, ctx, sentTweetUrls) {// 手动更新
       if (config.outputLogs) {
         logger.info('当前时间：', timenow, '本次请求的博主与链接：', id, bloggerUrl);
       }
-      console.log('当前时间：', timenow, '本次请求的博主与链接：', id, bloggerUrl);
-
       try {
         const latestTweets = await getLatestTweets(ctx.puppeteer, bloggerUrl, config);
         if (config.outputLogs) {
           logger.info('主函数返回的推文信息：', latestTweets);
         }
-        console.log('主函数返回的推文信息：', latestTweets);
-
         // 检查url是否获取成功
         if (latestTweets.length > 0) {
           const latestTweetLink = latestTweets[0].link;
           // 检查是否已经发送过该推文
-          console.log('当前已存储推文历史：', sentTweetUrls);
-          const existingTweet = sentTweetUrls.find(item => item.id === id);
+          const result = await ctx.database.get('xanalyse', {id:id});
+          const existingTweet = result[0].link;
+          if (config.outputLogs) {
+            logger.info('当前已存储推文历史：', existingTweet);
+            logger.info('本次获取的最新推文：', latestTweetLink);
+          }
 
-          if (existingTweet && existingTweet.link !== latestTweetLink) { // 未发送的情况
-            existingTweet.link = latestTweetLink; // 更新链接
+          if (!existingTweet || existingTweet !== latestTweetLink) { // 未发送过的情况
+            await ctx.database.upsert('xanalyse',[
+              {id, link: latestTweetLink}
+            ])// 更新数据库
             const isRetweet = latestTweets[0].isRetweet;
             const url = `${baseUrl}${latestTweetLink}`;
-            console.log('拼接后的推文url：', url);
             if (config.outputLogs) {
               logger.info('拼接后的推文url：', url);
             }
@@ -417,13 +324,10 @@ async function checkTweets(session, config, ctx, sentTweetUrls) {// 手动更新
                 推文图片url:${tpTweet.imgUrls}
               `);
             }
-            console.log(`
-              推文文字：${tpTweet.word_content}
-              推文图片url:${tpTweet.imgUrls}
-            `);
 
             // 请求图片url
             const fullImgUrls = tpTweet.imgUrls.map(src => `${baseUrl}${src}`);
+            console.log('fullimgurls:',fullImgUrls[0]);
             const imagePromises = fullImgUrls.map(async (imageUrl) => {
               let attempts = 0;
               const maxRetries = 3;
@@ -456,7 +360,7 @@ async function checkTweets(session, config, ctx, sentTweetUrls) {// 手动更新
             }
 
             // 构造消息内容
-            let msg = `${id} 发布了一条推文：\n${tweetWord}\n`;
+            let msg = `【${id}】 发布了一条推文：\n${tweetWord}\n`;
             if (isRetweet) {
               msg += "[提醒：这是一条转发推文]\n";
             }
@@ -465,7 +369,9 @@ async function checkTweets(session, config, ctx, sentTweetUrls) {// 手动更新
 
             // 发送消息到指定群聊
             const botKey = `${config.platform}:${config.account}`;
-            await ctx.bots[botKey].sendMessage(groupID, msg);
+            for (const groupId of groupID) {
+              await ctx.bots[botKey].sendMessage(groupId, msg);
+            }
           } else {
             if (config.outputLogs) {
               logger.info(`已发送过博主 ${id} 的最新推文，跳过`);
@@ -484,6 +390,39 @@ async function checkTweets(session, config, ctx, sentTweetUrls) {// 手动更新
     logger.error('主函数错误：', error);
     console.error('主函数错误：', error);
     await session.send('获取推文时出错，请检查网页链接的合法性或稍后重试。');
+  }
+}
+
+async function init(config, ctx) {// 初始化数据库
+  try {
+    // 遍历博主id并挨个请求最新推文url
+    const baseUrl = 'https://nitter.net';
+    for (const blogger of config.bloggers) {
+      const { id, groupID } = blogger;
+      const bloggerUrl = `${baseUrl}/${id}`;
+      const timenow = await getTimeNow();
+      if (config.outputLogs) {
+        logger.info('[初始化]当前时间：', timenow, '本次请求的博主:', id,'链接：', bloggerUrl);
+        logger.info('[初始化]当前博主推送群号：', groupID);
+      }
+      try {
+        const latestTweets = await getLatestTweets(ctx.puppeteer, bloggerUrl, config);
+        if (config.outputLogs) {
+          logger.info('[初始化]主函数返回的推文信息：', latestTweets[0].link);
+        }
+        // 检查url是否获取成功
+        if (latestTweets.length > 0) {
+            await ctx.database.upsert('xanalyse',[
+              {id, link: latestTweets[0].link}
+            ])
+          }
+      } catch (error) {
+        logger.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl},请检查博主id是否正确，注意：id前不需要有@`, error);
+      }
+    }
+    logger.info('初始化加载订阅成功！')
+  } catch (error) {
+    logger.error('初始化链接失败', error);
   }
 }
 
@@ -509,7 +448,6 @@ async function getScreenShot(pptr, url, maxRetries = 3) {// 获取指定帖子�
       page.set
       await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36");
       await page.goto(url, { waitUntil: 'networkidle0' });
-      // await page.reload({ waitUntil: 'networkidle0' }); // 刷新页面
 
       // 1、定位到元素
       const element = await page.$('div.css-175oi2r.r-1adg3ll');
@@ -544,9 +482,10 @@ async function translate(text:string, ctx, config) { // 翻译推文
       'Authorization': `Bearer ${config.apiKey}`,
     };
     const data = {
-      model: 'deepseek-chat', // DeepSeek翻译模型
+      model: 'deepseek-chat',
       messages: [
-        { role: 'user', content: `请将以下内容翻译成中文: ${text}` },
+        { role: 'system', content: "你是一个翻译助手" },
+        { role: 'user', content: `翻译成简体中文，直接给出翻译结果，不要有多余输出不要修改标点符号，如果遇到网址或者空白内容请不要翻译，请翻译: ${text}` },
       ],
       stream: false,
     };
