@@ -1,4 +1,3 @@
-import { url } from 'inspector';
 import { Context, Schema, h, Logger } from 'koishi'
 import { } from "koishi-plugin-puppeteer";
 
