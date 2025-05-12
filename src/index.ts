@@ -1,13 +1,11 @@
-import {Context, Schema, h, Logger} from 'koishi'
-import Puppeteer, {} from "koishi-plugin-puppeteer";
-import OpenAI from "openai";
-
+import { Context, Schema, h, Logger } from 'koishi'
+import { } from "koishi-plugin-puppeteer";
 
 export const name = 'xanalyse'
 
 export const logger = new Logger('xanalyse');
 
-export const inject = {required:["puppeteer","database"]};
+export const inject = { required: ["puppeteer", "database"] };
 
 export const usage = `
 <h1>X推送</h1>
@@ -36,10 +34,9 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.0.0</p>
+<p>1.0.1</p>
 <ul>
-<li>实现数据持久化，现在重启插件不会导致刷屏</li>
-<li>实现多群推送功能，现在一个博主的推文可以推送至多个群聊</li>
+<li>实现第三方deepseek api支持：siliconcloud</li>
 </ul>
 </div>
 <hr>
@@ -58,16 +55,18 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     account: Schema.string().required().description('机器人账号'),
     platform: Schema.string().required().description('机器人平台，例如onebot'),
-    updateInterval: Schema.number().min(1).default(5).description('检查推文更新间隔时间（单位分钟），建议每多两个订阅增加1分钟')
+    updateInterval: Schema.number().min(1).default(5).description('检查推文更新间隔时间（单位分钟），建议每多两个订阅增加1分钟'),
   }).description('基础设置'),
-  
+
   Schema.object({
     whe_translate: Schema.boolean().default(false).description('是否启用推文翻译（接入deepseek v3）')
   }).description('图文翻译设置'),
   Schema.union([
     Schema.object({
       whe_translate: Schema.const(true).required(),
-      apiKey:Schema.string().required().description('deepseek apiKey密钥<br>点此链接了解👉https://platform.deepseek.com/api_keys')
+      apiKey: Schema.string().required().description('deepseek apiKey密钥<br>点此链接了解👉https://platform.deepseek.com/api_keys'),
+      url: Schema.string().required().default('https://api.deepseek.com').description('默认为ds官方api接口，若使用siliconcloud平台请自行修改为https://api.siliconflow.cn/v1</br>'),
+      model: Schema.string().required().default('deepseek-chat').description('默认为ds官方模型，若要切换为siliconcloud平台对应模型，请前往https://cloud.siliconflow.cn/models 复制模型名称')
     }),
     Schema.object({}),
   ]),
@@ -75,7 +74,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     bloggers: Schema.array(Schema.object({
       id: Schema.string().description('Twitter博主用户名, 输@之后的用户名即可，不要加上@'),
-      groupID: Schema.array(String).role('table').description('需要推送的群号'),    
+      groupID: Schema.array(String).role('table').description('需要推送的群号'),
     })).description('订阅的博主列表，例：elonmusk'),
   }).description('订阅的博主列表'),
   Schema.object({
@@ -99,7 +98,7 @@ export interface Xanalyse {
 export async function apply(ctx: Context, config, session) {
   // 创建数据库
   try {
-    ctx.database.extend('xanalyse',{
+    ctx.database.extend('xanalyse', {
       id: 'string',
       link: 'string'
     })
@@ -109,16 +108,14 @@ export async function apply(ctx: Context, config, session) {
   }
 
   // 先初始化数据库，把每个博主的最新链接存储进link列
-  await init(config,ctx);
+  await init(config, ctx);
 
   // 定时推送
-  ctx.setInterval(async () => 
-   {checkTweets(session, config, ctx)}, config.updateInterval * 60 * 1000);
- 
-  
+  ctx.setInterval(async () => { checkTweets(session, config, ctx) }, config.updateInterval * 60 * 1000);
 
-  ctx.command('tt','主动检查一次推文更新')
-    .action(async ({session}) => {
+
+  ctx.command('tt', '主动检查一次推文更新')
+    .action(async ({ session }) => {
       await session.send("正在检查更新...");
       await checkTweets(session, config, ctx);
       // const is_imgurl = await getTimePushedTweet(ctx.puppeteer,'https://nitter.net/SECNAV/status/1917191078677299333');
@@ -126,27 +123,25 @@ export async function apply(ctx: Context, config, session) {
     });
 
   ctx.command('twitter [...arg]', '根据url获得twitter推文截图')
-    .action(async ({session}, ...arg) => {
+    .action(async ({ session }, ...arg) => {
       try {
         const url = arg.join(' ').trim();
-        if (url == ''){
-        await session.send("您输入的url为空");
-        }else{
+        if (url == '') {
+          await session.send("您输入的url为空");
+        } else {
           // 判断x链接并获取内容
           await session.send("正在获取帖子截图...");
           const imgBuffer = await getScreenShot(ctx.puppeteer, url);
-          await session.send(h.image(imgBuffer,"image/webp"));
+          await session.send(h.image(imgBuffer, "image/webp"));
         }
       } catch (error) {
-        if(config.outputLogs === true){
+        if (config.outputLogs === true) {
           logger.info("获取推文截图过程失败", error);
         }
         console.log("获取推文截图过程失败", error);
       }
     });
 }
-
-
 
 async function getTimePushedTweet(pptr, url, maxRetries = 3) {// 获得推文具体内容
   let attempts = 0;
@@ -165,10 +160,10 @@ async function getTimePushedTweet(pptr, url, maxRetries = 3) {// 获得推文具
 
       // 2、移除遮挡的 div 元素
       await page.evaluate(() => {
-        const overlayDiv = document.querySelector('nav');   
-        if (overlayDiv) {overlayDiv.remove();}else{
+        const overlayDiv = document.querySelector('nav');
+        if (overlayDiv) { overlayDiv.remove(); } else {
           console.log('未找到nav');
-        }       
+        }
       });
 
       // 2、获取推文文字内容
@@ -299,7 +294,7 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
         if (latestTweets.length > 0) {
           const latestTweetLink = latestTweets[0].link;
           // 检查是否已经发送过该推文
-          const result = await ctx.database.get('xanalyse', {id:id});
+          const result = await ctx.database.get('xanalyse', { id: id });
           const existingTweet = result[0].link;
           if (config.outputLogs) {
             logger.info('当前已存储推文历史：', existingTweet);
@@ -307,8 +302,8 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
           }
 
           if (!existingTweet || existingTweet !== latestTweetLink) { // 未发送过的情况
-            await ctx.database.upsert('xanalyse',[
-              {id, link: latestTweetLink}
+            await ctx.database.upsert('xanalyse', [
+              { id, link: latestTweetLink }
             ])// 更新数据库
             const isRetweet = latestTweets[0].isRetweet;
             const url = `${baseUrl}${latestTweetLink}`;
@@ -327,7 +322,7 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
 
             // 请求图片url
             const fullImgUrls = tpTweet.imgUrls.map(src => `${baseUrl}${src}`);
-            console.log('fullimgurls:',fullImgUrls[0]);
+            console.log('fullimgurls:', fullImgUrls[0]);
             const imagePromises = fullImgUrls.map(async (imageUrl) => {
               let attempts = 0;
               const maxRetries = 3;
@@ -351,11 +346,11 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
 
             // 根据config决定是否翻译推文
             let tweetWord;
-            if (config.whe_translate === true && config.apiKey){
-              const translation = await translate(tpTweet.word_content , ctx, config);
-              console.log('翻译结果',translation);
+            if (config.whe_translate === true && config.apiKey) {
+              const translation = await translate(tpTweet.word_content, ctx, config);
+              console.log('翻译结果', translation);
               tweetWord = translation;
-            }else{
+            } else {
               tweetWord = tpTweet.word_content;
             }
 
@@ -402,7 +397,7 @@ async function init(config, ctx) {// 初始化数据库
       const bloggerUrl = `${baseUrl}/${id}`;
       const timenow = await getTimeNow();
       if (config.outputLogs) {
-        logger.info('[初始化]当前时间：', timenow, '本次请求的博主:', id,'链接：', bloggerUrl);
+        logger.info('[初始化]当前时间：', timenow, '本次请求的博主:', id, '链接：', bloggerUrl);
         logger.info('[初始化]当前博主推送群号：', groupID);
       }
       try {
@@ -412,10 +407,10 @@ async function init(config, ctx) {// 初始化数据库
         }
         // 检查url是否获取成功
         if (latestTweets.length > 0) {
-            await ctx.database.upsert('xanalyse',[
-              {id, link: latestTweets[0].link}
-            ])
-          }
+          await ctx.database.upsert('xanalyse', [
+            { id, link: latestTweets[0].link }
+          ])
+        }
       } catch (error) {
         logger.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl},请检查博主id是否正确，注意：id前不需要有@`, error);
       }
@@ -456,10 +451,10 @@ async function getScreenShot(pptr, url, maxRetries = 3) {// 获取指定帖子�
       }
       // 2、移除遮挡的 div 元素
       await page.evaluate(() => {
-        const overlayDiv = document.querySelector('div.css-175oi2r.r-l5o3uw.r-1upvrn0.r-yz1j6i');   
-        const tiezi = document.querySelector('div.css-175oi2r.r-aqfbo4.r-gtdqiz.r-1gn8etr.r-1g40b8q');  
-        if (overlayDiv) {overlayDiv.remove();}       
-        if (tiezi) {tiezi.remove();}
+        const overlayDiv = document.querySelector('div.css-175oi2r.r-l5o3uw.r-1upvrn0.r-yz1j6i');
+        const tiezi = document.querySelector('div.css-175oi2r.r-aqfbo4.r-gtdqiz.r-1gn8etr.r-1g40b8q');
+        if (overlayDiv) { overlayDiv.remove(); }
+        if (tiezi) { tiezi.remove(); }
       });
       const screenshotBuffer = await element.screenshot({ type: "webp" }); // 获取完整截图
       await page.close();
@@ -475,36 +470,29 @@ async function getScreenShot(pptr, url, maxRetries = 3) {// 获取指定帖子�
   }
 }
 
-async function translate(text:string, ctx, config) { // 翻译推文
-  const url = 'https://api.deepseek.com/chat/completions';
-    const headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${config.apiKey}`,
-    };
-    const data = {
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: "你是一个翻译助手" },
-        { role: 'user', content: `翻译成简体中文，直接给出翻译结果，不要有多余输出不要修改标点符号，如果遇到网址或者空白内容请不要翻译，请翻译: ${text}` },
-      ],
-      stream: false,
-    };
-    try {
-      const response = await ctx.http.post(url, data, { headers });
-      console.log('翻译结果：',response.choices[0].message.content);
-      const translation = response.choices[0].message.content;
-      return translation;
-    } catch (err) {
-      logger.error('翻译失败，请检查token余额，或者稍后再试：', err);
-      return '翻译失败，请检查token余额，或者稍后再试。';
-    }
+async function translate(text: string, ctx, config) { // 翻译推文
+  const url = config.url + '/chat/completions';
+  const model = config.model
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${config.apiKey}`,
+  };
+  const data = {
+    model: model,
+    messages: [
+      { role: 'system', content: "你是一个翻译助手" },
+      { role: 'user', content: `翻译成简体中文，直接给出翻译结果，不要有多余输出不要修改标点符号，如果遇到网址或者空白内容请不要翻译，请翻译: ${text}` },
+    ],
+    stream: false,
+  };
+  try {
+    const response = await ctx.http.post(url, data, { headers });
+    console.log('返回结果：',response);
+    console.log('翻译结果：', response.choices[0].message.content);
+    const translation = response.choices[0].message.content;
+    return translation;
+  } catch (err) {
+    logger.error('翻译失败，请检查token余额，或者稍后再试：', err);
+    return '翻译失败，请检查token余额，或者稍后再试。';
+  }
 }
-
-
-
-      
-
-    
-    
-
- 
