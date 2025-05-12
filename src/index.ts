@@ -18,25 +18,30 @@ export const usage = `
 <h4>指令介绍：</h4>
 <p><b>twitter</b></p>
 <ul>
-<p> · 输入<code>twitter 推特帖子链接</code>即可获取此帖子的截图</p>
+<p> · 输入<code>twitter 推特帖子链接</code>即可获取此帖子的截图和以及翻译的内容和具体图片</p>
 <p>例：twitter https://x.com/tim_cook/status/1914665497565798835</p>
 </ul>
 <p><b>tt:</b></p>
 <ul>
-<p> · 发送<code>tt</code>后会自动检查一遍当前订阅的博主的最新推文（实验性）</p>
+<p> · 发送<code>tt</code>后会自动检查一遍当前订阅的博主的最新推文</p>
 <br>
 </ul>
 <p><b>📢注意：因为本插件基于镜像站，在填写完博主用户名后若初始化失败，请打开日志调试模式，手动点击生成的博主链接，查看是否正确引导至博主页面。若有误则可能因为博主id填写有误，请修改</b></p>
 <hr>
 <h3>Notice</h3>
-<p>Onebot 适配器下，偶尔发不出来图，Koishi 报错日志为 <code>retcode:1200</code> 时，请查看协议端日志自行解决！</p>
+<ul>
+<p> · 刚启动此插件的时候会初始化获取一遍订阅博主的最新推文并存入数据库，然后才会开始监听更新的推文</p>
+<p> · 现已支持第三方翻译api——siliconflow，选择模型请前往👉https://www.siliconflow.cn/ 点击左上角[产品]->siliconcloud，登录之后[邀请码:1ouyU0j5]即可在模型广场复制模型名称填入model选项<br><br>【推荐使用Pro/deepseek-ai/DeepSeek-V3，deepseek之外的模型没有测试过，可以自行试试】</p>
+</ul>
+
 <p><b>再次提醒：全程需✨🧙‍♂️，请在proxy-agent内配置代理</b></p>
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.0.1</p>
+<p>1.0.2</p>
 <ul>
-<li>实现第三方deepseek api支持：siliconcloud</li>
+<li>修复了required和default复用导致的推文内容翻译功能错误</li>
+<li>为推文截图命令twitter，增加了翻译推文内容+获取推文图片功能，不只是单纯的截图</li>
 </ul>
 </div>
 <hr>
@@ -65,8 +70,8 @@ export const Config: Schema<Config> = Schema.intersect([
     Schema.object({
       whe_translate: Schema.const(true).required(),
       apiKey: Schema.string().required().description('deepseek apiKey密钥<br>点此链接了解👉https://platform.deepseek.com/api_keys'),
-      url: Schema.string().required().default('https://api.deepseek.com').description('默认为ds官方api接口，若使用siliconcloud平台请自行修改为https://api.siliconflow.cn/v1</br>'),
-      model: Schema.string().required().default('deepseek-chat').description('默认为ds官方模型，若要切换为siliconcloud平台对应模型，请前往https://cloud.siliconflow.cn/models 复制模型名称')
+      apiurl: Schema.string().default('https://api.deepseek.com').description('默认为ds官方api接口，若使用siliconcloud平台请自行修改为https://api.siliconflow.cn/v1</br>'),
+      model: Schema.string().default('deepseek-chat').description('默认为ds官方模型，若要切换为siliconflow平台对应模型，请上滑页面查看Notice')
     }),
     Schema.object({}),
   ]),
@@ -109,17 +114,14 @@ export async function apply(ctx: Context, config, session) {
 
   // 先初始化数据库，把每个博主的最新链接存储进link列
   await init(config, ctx);
-
+  
   // 定时推送
   ctx.setInterval(async () => { checkTweets(session, config, ctx) }, config.updateInterval * 60 * 1000);
-
 
   ctx.command('tt', '主动检查一次推文更新')
     .action(async ({ session }) => {
       await session.send("正在检查更新...");
       await checkTweets(session, config, ctx);
-      // const is_imgurl = await getTimePushedTweet(ctx.puppeteer,'https://nitter.net/SECNAV/status/1917191078677299333');
-      // console.log('是否存在url', is_imgurl.imgUrls);
     });
 
   ctx.command('twitter [...arg]', '根据url获得twitter推文截图')
@@ -131,8 +133,38 @@ export async function apply(ctx: Context, config, session) {
         } else {
           // 判断x链接并获取内容
           await session.send("正在获取帖子截图...");
-          const imgBuffer = await getScreenShot(ctx.puppeteer, url);
-          await session.send(h.image(imgBuffer, "image/webp"));
+          const shotcontent = await getScreenShot(ctx.puppeteer, url, config, ctx);
+
+          // 请求图片url
+          const fullImgUrls = shotcontent.imgUrls;
+          console.log('fullimgurls:', fullImgUrls[0]);
+          const imagePromises = fullImgUrls.map(async (imageUrl) => {
+            let attempts = 0;
+            const maxRetries = 3;
+            while (attempts < maxRetries) {
+              try {
+                const response = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
+                return h.image(response, 'image/webp'); // 根据图片格式调整 MIME 类型
+              } catch (error) {
+                attempts++;
+                logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
+                console.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
+                if (attempts >= maxRetries) {
+                  logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
+                  console.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
+                  return null;
+                }
+              }
+            }
+          });
+          const images = (await Promise.all(imagePromises)).filter((img) => img !== null); // 过滤掉请求失败的图片
+          
+          // 构造消息内容
+          let msg = `${shotcontent.tweetWord}\n`;
+          msg += `${h.image(shotcontent.screenshotBuffer, "image/webp")}\n`;
+          msg += `${images.join('\n')}`;
+          // 发送消息
+          await session.send(msg);
         }
       } catch (error) {
         if (config.outputLogs === true) {
@@ -415,7 +447,7 @@ async function init(config, ctx) {// 初始化数据库
         logger.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl},请检查博主id是否正确，注意：id前不需要有@`, error);
       }
     }
-    logger.info('初始化加载订阅成功！')
+    logger.info('初始化加载订阅完成！')
   } catch (error) {
     logger.error('初始化链接失败', error);
   }
@@ -435,8 +467,9 @@ async function getTimeNow() {// 获得当前时间
   return formattedDate
 }
 
-async function getScreenShot(pptr, url, maxRetries = 3) {// 获取指定帖子截图
+async function getScreenShot(pptr, url, config, ctx) {// 获取指定帖子截图
   let attempts = 0;
+  const maxRetries = 3;
   while (attempts < maxRetries) {
     try {
       const page = await pptr.page();
@@ -449,6 +482,7 @@ async function getScreenShot(pptr, url, maxRetries = 3) {// 获取指定帖子�
       if (!element) {
         throw new Error('未能找到指定的元素');
       }
+
       // 2、移除遮挡的 div 元素
       await page.evaluate(() => {
         const overlayDiv = document.querySelector('div.css-175oi2r.r-l5o3uw.r-1upvrn0.r-yz1j6i');
@@ -456,22 +490,65 @@ async function getScreenShot(pptr, url, maxRetries = 3) {// 获取指定帖子�
         if (overlayDiv) { overlayDiv.remove(); }
         if (tiezi) { tiezi.remove(); }
       });
+      // 3、获取推文文字
+      const word_content = await page.evaluate(() => {
+        const txt_element = document.querySelector('div.css-175oi2r.r-1s2bzr4');
+        if (!txt_element) {
+          console.error('未获取推文文字内容');
+          return '';
+        }
+        let textContent = txt_element.textContent || '';
+        textContent = textContent.replace('翻译帖子','');
+        return textContent.trim();
+      });
+      // 4、获取推文图片url
+      const imgUrls = await page.evaluate(() => {
+        const firstTimelineItem = document.querySelector('div.css-175oi2r.r-16y2uox.r-1pi2tsx.r-13qz1uu');
+        if (!firstTimelineItem) return [];
+        const imgElements = firstTimelineItem.querySelectorAll('img');
+        const srcs = [];
+        for (const imgElement of imgElements) {
+          const src = imgElement.getAttribute('src');
+          if (src) {
+            srcs.push(src);
+          }
+        }
+        return srcs;
+      });
+      console.log('图片urls', imgUrls);
+
+      if (config.outputLogs) {
+        logger.info(`
+          推文文字：${word_content}
+          图片url：${imgUrls}
+        `);
+      }
+
+      // 5、翻译推文文字
+      let tweetWord;
+      if (config.whe_translate === true && config.apiKey) {
+        const translation = await translate(word_content, ctx, config);
+        console.log('翻译结果', translation);
+        tweetWord = translation;
+      } else {
+        tweetWord = word_content;
+      }
       const screenshotBuffer = await element.screenshot({ type: "webp" }); // 获取完整截图
       await page.close();
-      return screenshotBuffer;
+      return {screenshotBuffer, tweetWord, imgUrls};
     } catch (error) {
       attempts++;
       console.error(`获取推文截图时出错，正在尝试第 ${attempts} 次重试...`, error);
       if (attempts >= maxRetries) {
         console.error(`获取推文截图时出错，已达最大重试次数。`, error);
-        return [];
+        return;
       }
     }
   }
 }
 
 async function translate(text: string, ctx, config) { // 翻译推文
-  const url = config.url + '/chat/completions';
+  const url = config.apiurl + '/chat/completions';
   const model = config.model
   const headers = {
     'Content-Type': 'application/json',
@@ -492,7 +569,7 @@ async function translate(text: string, ctx, config) { // 翻译推文
     const translation = response.choices[0].message.content;
     return translation;
   } catch (err) {
-    logger.error('翻译失败，请检查token余额，或者稍后再试：', err);
-    return '翻译失败，请检查token余额，或者稍后再试。';
+    logger.error('翻译失败，请检查apiToken余额或检查api是否配置正确：', err);
+    return '翻译失败，请检查apiToken余额或检查api是否配置正确';
   }
 }
