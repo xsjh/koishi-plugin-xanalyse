@@ -43,6 +43,11 @@ export const usage = `
 <li>修复了required和default复用导致的推文内容翻译功能错误</li>
 <li>为推文截图命令twitter，增加了翻译推文内容+获取推文图片功能，不只是单纯的截图</li>
 </ul>
+<p>1.0.3</p>
+<ul>
+<li>对数据库中已存在的博主不再重复初始化，大幅提升插件初始化速度</li>
+<li>增加了更多的日志输出信息</li>
+</ul>
 </div>
 <hr>
 <h2>⚠！重要告示！⚠</h2>
@@ -133,11 +138,14 @@ export async function apply(ctx: Context, config, session) {
         } else {
           // 判断x链接并获取内容
           await session.send("正在获取帖子截图...");
+          logger.info('开始请求的推文连接：', url);
           const shotcontent = await getScreenShot(ctx.puppeteer, url, config, ctx);
 
           // 请求图片url
           const fullImgUrls = shotcontent.imgUrls;
-          console.log('fullimgurls:', fullImgUrls[0]);
+          if(config.outputLogs){
+            logger.info('推文图片完整链接:', fullImgUrls);
+          }
           const imagePromises = fullImgUrls.map(async (imageUrl) => {
             let attempts = 0;
             const maxRetries = 3;
@@ -147,11 +155,9 @@ export async function apply(ctx: Context, config, session) {
                 return h.image(response, 'image/webp'); // 根据图片格式调整 MIME 类型
               } catch (error) {
                 attempts++;
-                logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                console.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
+                logger.info(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
                 if (attempts >= maxRetries) {
-                  logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                  console.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
+                  logger.info(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);   
                   return null;
                 }
               }
@@ -167,10 +173,8 @@ export async function apply(ctx: Context, config, session) {
           await session.send(msg);
         }
       } catch (error) {
-        if (config.outputLogs === true) {
-          logger.info("获取推文截图过程失败", error);
-        }
-        console.log("获取推文截图过程失败", error);
+        await session.send('获取推文内容失败', error);
+        logger.info("获取推文截图过程失败", error);
       }
     });
 }
@@ -276,23 +280,17 @@ async function getLatestTweets(pptr, url, config, maxRetries = 3) {// 获得订�
           const retweetHeader = item.querySelector('div.retweet-header');
           const isRetweet = retweetHeader ? true : false; // 检查是否为转发推文
 
-          const tweetLink = item.querySelector('a.tweet-link');
-          if (config.outputLogs) {
-            console.log('本次获取的tweetLink:', tweetLink);
-          }
+          const tweetLink = item.querySelector('a.tweet-link');         
           if (tweetLink) {
             tweetLinks.push({
               link: tweetLink.getAttribute('href'),
               isRetweet: isRetweet, // 添加转发标志
-            });
-            if (config.outputLogs) {
-              console.log('存储的tweetLinks', tweetLinks);
-            }
+            });           
           }
         }
         return tweetLinks.slice(0, 1); // 获取最新推文
       }, config);
-
+    
       await page.close();
       return tweets;
     } catch (error) {
@@ -403,7 +401,6 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
             if (config.outputLogs) {
               logger.info(`已发送过博主 ${id} 的最新推文，跳过`);
             }
-            console.log(`已发送过博主 ${id} 的最新推文，跳过`);
           }
         }
       } catch (error) {
@@ -422,9 +419,17 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
 
 async function init(config, ctx) {// 初始化数据库
   try {
+    // 获取数据库中已存在的博主id，并过滤
+    const existingIds = await ctx.database.get('xanalyse', {}, ['id']);
+    const existingIdSet = new Set(existingIds.map(item => item.id));
+    const newBloggers = config.bloggers.filter(blogger => !existingIdSet.has(blogger.id));
+    if (config.outputLogs) {
+      logger.info(`[初始化]数据库中已存在的博主id：${Array.from(existingIdSet).join(', ')}`);
+      logger.info(`[初始化]需要初始化的博主id：${newBloggers.map(blogger => blogger.id).join(', ')}`);
+    }
     // 遍历博主id并挨个请求最新推文url
     const baseUrl = 'https://nitter.net';
-    for (const blogger of config.bloggers) {
+    for (const blogger of newBloggers) {
       const { id, groupID } = blogger;
       const bloggerUrl = `${baseUrl}/${id}`;
       const timenow = await getTimeNow();
@@ -503,7 +508,7 @@ async function getScreenShot(pptr, url, config, ctx) {// 获取指定帖子截�
       });
       // 4、获取推文图片url
       const imgUrls = await page.evaluate(() => {
-        const firstTimelineItem = document.querySelector('div.css-175oi2r.r-16y2uox.r-1pi2tsx.r-13qz1uu');
+        const firstTimelineItem = document.querySelector('div.css-175oi2r.r-1pi2tsx.r-13qz1uu.r-eqz5dr');
         if (!firstTimelineItem) return [];
         const imgElements = firstTimelineItem.querySelectorAll('img');
         const srcs = [];
@@ -515,12 +520,12 @@ async function getScreenShot(pptr, url, config, ctx) {// 获取指定帖子截�
         }
         return srcs;
       });
-      console.log('图片urls', imgUrls);
+      
 
       if (config.outputLogs) {
         logger.info(`
           推文文字：${word_content}
-          图片url：${imgUrls}
+          正在请求图片url：${imgUrls}
         `);
       }
 
@@ -564,12 +569,14 @@ async function translate(text: string, ctx, config) { // 翻译推文
   };
   try {
     const response = await ctx.http.post(url, data, { headers });
-    console.log('返回结果：',response);
+    if(config.outputLogs){
+      logger.info('翻译api返回结果：',response); 
+    }
     console.log('翻译结果：', response.choices[0].message.content);
     const translation = response.choices[0].message.content;
     return translation;
   } catch (err) {
-    logger.error('翻译失败，请检查apiToken余额或检查api是否配置正确：', err);
-    return '翻译失败，请检查apiToken余额或检查api是否配置正确';
+    logger.error('翻译失败，请检查api余额或检查api是否配置正确：', err);
+    return '翻译失败，请检查api余额或检查api是否配置正确';
   }
 }
