@@ -10,7 +10,7 @@ export const inject = { required: ["puppeteer", "database"] };
 export const usage = `
 <h1>X推送</h1>
 <p><b>全程需✨🧙‍♂️，请在proxy-agent内配置代理</b></p>
-<p><b>跟随系统代理方式：</b>在proxy-agent代理服务器地址填写<code>http://127.0.0.1:7890</code></p>
+<p><b>跟随系统代理方式：</b>在proxy-agent代理服务器地址填写<code>http://127.0.0.1:7890</code>，如果不行请自行搜索<code>xx系统怎么查看本机的代理端口</code></p>
 <p>数据来源于 <a href="https://nitter.net/" target="_blank">nitter.net</a></p>
 <hr>
 <h2>Tutorials</h2>
@@ -48,6 +48,15 @@ export const usage = `
 <li>对数据库中已存在的博主不再重复初始化，大幅提升插件初始化速度</li>
 <li>增加了更多的日志输出信息</li>
 </ul>
+<p>1.0.4</p>
+<ul>
+<li>优化判断逻辑，修复推文重复推送的问题</li>
+</ul>
+<p>1.0.5</p>
+<ul>
+<li>优化，增加更换nitter站点功能</li>
+<li>预计下版本优化ui，将订阅设置变为表格</li>
+</ul>
 </div>
 <hr>
 <h2>⚠！重要告示！⚠</h2>
@@ -69,8 +78,9 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('基础设置'),
 
   Schema.object({
+    baseUrl: Schema.string().default('https://nitter.net').description('此处可以更改不同nitter站点，若默认不可用，可自行寻找并尝试<br>开发时测试可用：https://nitter.poast.org').experimental(),
     whe_translate: Schema.boolean().default(false).description('是否启用推文翻译（接入deepseek v3）')
-  }).description('图文翻译设置'),
+  }).description('域名与翻译设置'),
   Schema.union([
     Schema.object({
       whe_translate: Schema.const(true).required(),
@@ -87,6 +97,14 @@ export const Config: Schema<Config> = Schema.intersect([
       groupID: Schema.array(String).role('table').description('需要推送的群号'),
     })).description('订阅的博主列表，例：elonmusk'),
   }).description('订阅的博主列表'),
+
+  // Schema.object({
+  //   bloggers: Schema.array(Schema.object({
+  //     id: Schema.string().description('Twitter博主用户名【输@之后的用户名即可，不要加上@】'),
+  //     groupID: Schema.string().description('需要推送的群号'),
+  // })).role('table'),
+  // }).description('订阅的博主列表---表格表格表格'),
+
   Schema.object({
     outputLogs: Schema.boolean().default(true).description('日志调试模式，开启以获得更多信息').experimental(),
   }).description('调试设置'),
@@ -101,7 +119,12 @@ declare module 'koishi' {
 //表的接口类型
 export interface Xanalyse {
   id: string,
-  link: string
+  link: string,
+  content: string
+}
+export interface LatestResult {
+  tweets: Array<{ link: string; isRetweet: boolean }>;
+  word_content: string;
 }
 
 
@@ -110,7 +133,8 @@ export async function apply(ctx: Context, config, session) {
   try {
     ctx.database.extend('xanalyse', {
       id: 'string',
-      link: 'string'
+      link: 'string',
+      content: 'string'
     })
     logger.info('数据库初始化成功')
   } catch (error) {
@@ -180,10 +204,11 @@ export async function apply(ctx: Context, config, session) {
 }
 
 async function getTimePushedTweet(pptr, url, maxRetries = 3) {// 获得推文具体内容
+  let page;
   let attempts = 0;
   while (attempts < maxRetries) {
     try {
-      const page = await pptr.page(); // 初始化浏览器
+      page = await pptr.page(); // 初始化浏览器
       await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36");
       await page.goto(url, { waitUntil: 'networkidle0' });
       await page.reload({ waitUntil: 'networkidle0' }); // 防止加载不出刷新页面
@@ -255,19 +280,44 @@ async function getTimePushedTweet(pptr, url, maxRetries = 3) {// 获得推文具
           screenshotBuffer: null
         };
       }
+    } finally{
+       if (page) await page.close().catch(() => {});
     }
   }
 }
 
-async function getLatestTweets(pptr, url, config, maxRetries = 3) {// 获得订阅博主最新推文url
+async function getLatestTweets(pptr, url, config, maxRetries = 3): Promise<LatestResult> {// 获得订阅博主最新推文url和判重内容
+  let page;
   let attempts = 0;
   while (attempts < maxRetries) {
     try {
-      const page = await pptr.page();
+      page = await pptr.page();
       await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36");
       await page.goto(url, { waitUntil: 'networkidle0' });
       await page.reload({ waitUntil: 'networkidle0' }); // 刷新页面
 
+      // 获取推文文字内容和首张照片url
+      const element = await page.$('div.timeline-item');
+      if (!element) {
+        throw new Error('未能找到指定的元素');
+      }
+      await page.evaluate(() => {
+        const overlayDiv = document.querySelector('nav');
+        if (overlayDiv) { overlayDiv.remove(); } else {
+          console.log('未找到nav');
+        }
+      });
+      const word_content = await page.evaluate(() => {
+        const txt_element = document.querySelector('div.tweet-content.media-body');
+        if (!txt_element) {
+          console.error('未获取推文文字内容');
+          return '';
+        }
+        let textContent = txt_element.textContent || '';
+        return textContent.trim();
+      });
+
+      // 获取推文
       const tweets = await page.evaluate((config) => {
         const timelineItems = document.querySelectorAll('div.timeline-item');
         console.log('timelineitems_all:', timelineItems);
@@ -290,16 +340,19 @@ async function getLatestTweets(pptr, url, config, maxRetries = 3) {// 获得订�
         }
         return tweetLinks.slice(0, 1); // 获取最新推文
       }, config);
-    
+
       await page.close();
-      return tweets;
+      return {tweets, word_content};
+
     } catch (error) {
       attempts++;
       console.error(`获取博主 ${url} 的推文时出错，正在尝试第 ${attempts} 次重试...`, error);
       if (attempts >= maxRetries) {
         console.error(`获取博主 ${url} 的推文时出错，已达最大重试次数。`, error);
-        return [];
+        return { tweets: [], word_content: ''}; // 返回空对象
       }
+    } finally{
+      if (page) await page.close().catch(() => {});
     }
   }
 }
@@ -307,7 +360,8 @@ async function getLatestTweets(pptr, url, config, maxRetries = 3) {// 获得订�
 async function checkTweets(session, config, ctx) {// 更新一次推文
   try {
     // 遍历博主id并挨个请求最新推文url
-    const baseUrl = 'https://nitter.net';
+    // const baseUrl = 'https://nitter.net';
+    const baseUrl = config.baseUrl;
     for (const blogger of config.bloggers) {
       const { id, groupID } = blogger;
       const bloggerUrl = `${baseUrl}/${id}`;
@@ -315,27 +369,41 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
       if (config.outputLogs) {
         logger.info('当前时间：', timenow, '本次请求的博主与链接：', id, bloggerUrl);
       }
+
       try {
-        const latestTweets = await getLatestTweets(ctx.puppeteer, bloggerUrl, config);
+        const { tweets, word_content} = await getLatestTweets(ctx.puppeteer, bloggerUrl, config);
         if (config.outputLogs) {
-          logger.info('主函数返回的推文信息：', latestTweets);
+          logger.info('主函数返回的推文信息：', tweets);
         }
+        if (!tweets || tweets.length === 0) {
+          if (config.outputLogs) logger.info(`博主 ${id} 暂无新推文`);
+          continue;
+        }
+        // 生成轻量判重键
+        const contentPreview = word_content.slice(0, 15);
+
         // 检查url是否获取成功
-        if (latestTweets.length > 0) {
-          const latestTweetLink = latestTweets[0].link;
+        if (tweets.length > 0) {
+          const latestTweetLink = tweets[0].link;
+          const latestTweetcontent = contentPreview;
           // 检查是否已经发送过该推文
           const result = await ctx.database.get('xanalyse', { id: id });
           const existingTweet = result[0].link;
+          const existingContent = result[0].content;
           if (config.outputLogs) {
-            logger.info('当前已存储推文历史：', existingTweet);
-            logger.info('本次获取的最新推文：', latestTweetLink);
+            logger.info('当前已存储推文历史：', existingTweet + existingContent);
+            logger.info('本次获取的最新推文：', latestTweetLink + latestTweetcontent);
           }
 
-          if (!existingTweet || existingTweet !== latestTweetLink) { // 未发送过的情况
+          if (!existingContent || existingContent !== latestTweetcontent) { // 推文未发送过的情况
+            if (config.outputLogs) {
+            logger.info('结果：', existingContent, '不等于', latestTweetcontent, '准备更新并推送新推文');
+          }
             await ctx.database.upsert('xanalyse', [
-              { id, link: latestTweetLink }
+              { id, link: latestTweetLink, content: contentPreview}
             ])// 更新数据库
-            const isRetweet = latestTweets[0].isRetweet;
+
+            const isRetweet = tweets[0].isRetweet;
             const url = `${baseUrl}${latestTweetLink}`;
             if (config.outputLogs) {
               logger.info('拼接后的推文url：', url);
@@ -428,7 +496,8 @@ async function init(config, ctx) {// 初始化数据库
       logger.info(`[初始化]需要初始化的博主id：${newBloggers.map(blogger => blogger.id).join(', ')}`);
     }
     // 遍历博主id并挨个请求最新推文url
-    const baseUrl = 'https://nitter.net';
+    // const baseUrl = 'https://nitter.net';
+    const baseUrl = config.baseUrl;
     for (const blogger of newBloggers) {
       const { id, groupID } = blogger;
       const bloggerUrl = `${baseUrl}/${id}`;
@@ -438,14 +507,16 @@ async function init(config, ctx) {// 初始化数据库
         logger.info('[初始化]当前博主推送群号：', groupID);
       }
       try {
-        const latestTweets = await getLatestTweets(ctx.puppeteer, bloggerUrl, config);
+        const { tweets, word_content} = await getLatestTweets(ctx.puppeteer, bloggerUrl, config);
+        // 生成轻量判重键
+        const contentPreview = word_content.slice(0, 15);
         if (config.outputLogs) {
-          logger.info('[初始化]主函数返回的推文信息：', latestTweets[0].link);
+          logger.info('[初始化]主函数返回的推文信息：', tweets[0].link);
         }
         // 检查url是否获取成功
-        if (latestTweets.length > 0) {
+        if (tweets.length > 0) {
           await ctx.database.upsert('xanalyse', [
-            { id, link: latestTweets[0].link }
+            { id, link: tweets[0].link, content: contentPreview}
           ])
         }
       } catch (error) {
@@ -472,7 +543,7 @@ async function getTimeNow() {// 获得当前时间
   return formattedDate
 }
 
-async function getScreenShot(pptr, url, config, ctx) {// 获取指定帖子截图
+async function getScreenShot(pptr, url, config, ctx) {// 获取指定x帖子截图
   let attempts = 0;
   const maxRetries = 3;
   while (attempts < maxRetries) {
@@ -562,7 +633,7 @@ async function translate(text: string, ctx, config) { // 翻译推文
   const data = {
     model: model,
     messages: [
-      { role: 'system', content: "你是一个翻译助手" },
+      // { role: 'system', content: "你是一个翻译助手" },
       { role: 'user', content: `翻译成简体中文，直接给出翻译结果，不要有多余输出不要修改标点符号，如果遇到网址或者空白内容请不要翻译，请翻译: ${text}` },
     ],
     stream: false,
