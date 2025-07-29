@@ -38,9 +38,9 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.0.6</p>
+<p>1.0.7</p>
 <ul>
-<li>修复了判重内容一直从置顶推文获取导致新推不推送错误</li>
+<li>修复了字符编码问题导致的重复推送</li>
 <li>预计下版本博主信息ui更改为表格形式</li>
 </ul>
 </div>
@@ -364,8 +364,11 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
           if (config.outputLogs) logger.info(`博主 ${id} 暂无新推文`);
           continue;
         }
-        // 生成轻量判重键
-        const contentPreview = word_content.slice(0, 15);
+
+        // 生成轻量判重键，确保字符编码为 UTF-8
+        const encoder = new TextEncoder();
+        const contentPreviewEncoded = encoder.encode(word_content.slice(0, 15));
+        const contentPreview = new TextDecoder('utf-8').decode(contentPreviewEncoded);
 
         // 检查url是否获取成功
         if (tweets.length > 0) {
@@ -635,4 +638,11 @@ async function translate(text: string, ctx, config) { // 翻译推文
     logger.error('翻译失败，请检查api余额或检查api是否配置正确：', err);
     return '翻译失败，请检查api余额或检查api是否配置正确';
   }
+}
+
+async function test(ctx) { // 测试用例
+   // 查看数据库字符集
+        const charsetResult = await ctx.database.query('SHOW VARIABLES LIKE \'character_set%\'');
+        console.log('数据库字符集设置:', charsetResult);
+        logger.info('数据库字符集设置:', charsetResult);
 }
