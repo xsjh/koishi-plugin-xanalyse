@@ -38,24 +38,10 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.0.2</p>
+<p>1.0.6</p>
 <ul>
-<li>修复了required和default复用导致的推文内容翻译功能错误</li>
-<li>为推文截图命令twitter，增加了翻译推文内容+获取推文图片功能，不只是单纯的截图</li>
-</ul>
-<p>1.0.3</p>
-<ul>
-<li>对数据库中已存在的博主不再重复初始化，大幅提升插件初始化速度</li>
-<li>增加了更多的日志输出信息</li>
-</ul>
-<p>1.0.4</p>
-<ul>
-<li>优化判断逻辑，修复推文重复推送的问题</li>
-</ul>
-<p>1.0.5</p>
-<ul>
-<li>优化，增加更换nitter站点功能</li>
-<li>预计下版本优化ui，将订阅设置变为表格</li>
+<li>修复了判重内容一直从置顶推文获取导致新推不推送错误</li>
+<li>预计下版本博主信息ui更改为表格形式</li>
 </ul>
 </div>
 <hr>
@@ -296,53 +282,52 @@ async function getLatestTweets(pptr, url, config, maxRetries = 3): Promise<Lates
       await page.goto(url, { waitUntil: 'networkidle0' });
       await page.reload({ waitUntil: 'networkidle0' }); // 刷新页面
 
-      // 获取推文文字内容和首张照片url
-      const element = await page.$('div.timeline-item');
-      if (!element) {
-        throw new Error('未能找到指定的元素');
-      }
-      await page.evaluate(() => {
-        const overlayDiv = document.querySelector('nav');
-        if (overlayDiv) { overlayDiv.remove(); } else {
-          console.log('未找到nav');
-        }
-      });
-      const word_content = await page.evaluate(() => {
-        const txt_element = document.querySelector('div.tweet-content.media-body');
-        if (!txt_element) {
-          console.error('未获取推文文字内容');
-          return '';
-        }
-        let textContent = txt_element.textContent || '';
-        return textContent.trim();
-      });
-
       // 获取推文
       const tweets = await page.evaluate((config) => {
-        const timelineItems = document.querySelectorAll('div.timeline-item');
-        console.log('timelineitems_all:', timelineItems);
-        const tweetLinks = [];
+      const timelineItems = document.querySelectorAll('div.timeline-item');
+      const tweetLinks = [];
 
-        for (const item of timelineItems) {
-          const pinned = item.querySelector('div.pinned');
-          if (pinned) continue; // 跳过置顶推文
+      for (const item of timelineItems) {
+        // 跳过滤置顶推文
+        const pinned = item.querySelector('div.pinned, .pinned-item, .pin-header');
+        if (pinned) continue;
 
-          const retweetHeader = item.querySelector('div.retweet-header');
-          const isRetweet = retweetHeader ? true : false; // 检查是否为转发推文
-
-          const tweetLink = item.querySelector('a.tweet-link');         
-          if (tweetLink) {
-            tweetLinks.push({
-              link: tweetLink.getAttribute('href'),
-              isRetweet: isRetweet, // 添加转发标志
-            });           
-          }
+        // 获取推文文字内容
+        const txt_element = item.querySelector('div.tweet-content.media-body');
+        let word_content = '';
+        if (txt_element) {
+          word_content = txt_element.textContent.trim() || '';
+        } else {
+          console.error('未获取推文文字内容');
         }
-        return tweetLinks.slice(0, 1); // 获取最新推文
-      }, config);
 
-      await page.close();
-      return {tweets, word_content};
+        // 检查是否为转发推文
+        const retweetHeader = item.querySelector('div.retweet-header');
+        const isRetweet = retweetHeader ? true : false;
+
+        // 获取推文链接
+        const tweetLink = item.querySelector('a.tweet-link');
+        if (tweetLink) {
+          tweetLinks.push({
+            link: tweetLink.getAttribute('href'),
+            isRetweet: isRetweet,
+            word_content: word_content
+          });
+        }
+      }
+      return tweetLinks.slice(0, 1); // 获取最新推文
+    }, config);
+
+    await page.close();
+
+    // 返回结果
+    return {
+      tweets: tweets.map(tweet => ({
+        link: tweet.link,
+        isRetweet: tweet.isRetweet
+      })),
+      word_content: tweets.length > 0 ? tweets[0].word_content : ''
+    };
 
     } catch (error) {
       attempts++;
