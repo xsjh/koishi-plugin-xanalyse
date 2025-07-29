@@ -38,9 +38,9 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.0.7</p>
+<p>1.0.8</p>
 <ul>
-<li>修复了字符编码问题导致的重复推送</li>
+<li>修复了空字符导致的重复推送</li>
 <li>预计下版本博主信息ui更改为表格形式</li>
 </ul>
 </div>
@@ -369,6 +369,8 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
         const encoder = new TextEncoder();
         const contentPreviewEncoded = encoder.encode(word_content.slice(0, 15));
         const contentPreview = new TextDecoder('utf-8').decode(contentPreviewEncoded);
+        // 如果内容为空，设置一个默认值或跳过判重
+        const finalContentPreview = contentPreview || 'empty_content';
 
         // 检查url是否获取成功
         if (tweets.length > 0) {
@@ -383,13 +385,16 @@ async function checkTweets(session, config, ctx) {// 更新一次推文
             logger.info('本次获取的最新推文：', latestTweetLink + latestTweetcontent);
           }
 
-          if (!existingContent || existingContent !== latestTweetcontent) { // 推文未发送过的情况
+          // 如果内容为空，且数据库中已有记录，视为已发送过
+          if (finalContentPreview === 'empty_content' && existingContent === 'empty_content') {
+            logger.info(`已发送过博主 ${id} 的最新推文，跳过`);
+          } else if (!existingContent || existingContent !== latestTweetcontent) { // 推文未发送过的情况
             if (config.outputLogs) {
-            logger.info('结果：', existingContent, '不等于', latestTweetcontent, '准备更新并推送新推文');
-          }
+              logger.info('结果：', existingContent, '不等于', latestTweetcontent, '准备更新并推送新推文');
+            }
             await ctx.database.upsert('xanalyse', [
-              { id, link: latestTweetLink, content: contentPreview}
-            ])// 更新数据库
+              { id, link: latestTweetLink, content: finalContentPreview }
+            ]); // 更新数据库
 
             const isRetweet = tweets[0].isRetweet;
             const url = `${baseUrl}${latestTweetLink}`;
