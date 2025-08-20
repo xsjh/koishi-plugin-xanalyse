@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-xanalyse",
-  "description": "twitter伪推送",
-  "version": "1.0.8",
+  "description": "twitter推送解析",
+  "version": "1.1.1",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
