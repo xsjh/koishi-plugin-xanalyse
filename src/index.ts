@@ -414,6 +414,15 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
         const DateResult = await ctx.database.get('xanalyse', { id: id });
         const existingTweetLink = DateResult[0]?.link || '';
         const existingContent = DateResult[0]?.content || '';
+        // 若本次未成功获取到最新推文链接，则跳过以避免覆盖为null
+        if (!latestTweetLink) {
+            if (config.outputLogs) {
+              logger.info(
+                `本次未获取到博主 ${id} 的最新推文链接，跳过推文链接更新`
+              );
+            }
+            continue;
+          }
         if (config.outputLogs) {
           logger.info('当前已存储推文历史：', existingTweetLink);
           logger.info('本次获取的最新推文：', latestTweetLink);
