@@ -43,11 +43,12 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.1.1</p>
+<p>1.1.2</p>
 <ul>
-<li>不再从镜像站获取内容，而直接从x.com获取</li>
-<li>现在可以订阅并解析视频推文</li>
-<li>修复了一些依赖问题</li>
+<li>修复了同时存在图片视频的推文的推送问题</li>
+<li>修复了对受保护账号的推送</li>
+<li>修复了当获取推文链接失败时使该博主数据库导致的重复推送</li>
+<li>精简了部分代码</li>
 </ul>
 </div>
 <hr>
@@ -56,7 +57,6 @@ export const usage = `
 <hr>
 <h4>如果想继续开发优化本插件，<a href="https://github.com/xsjh/koishi-plugin-xanalyse/pulls" target="_blank">欢迎 PR</a></h4>
 </body>
-
 `;
 
 export interface Config {
@@ -114,6 +114,7 @@ export interface LatestResult {
 }
 
 
+
 export async function apply(ctx: Context, config, session) {
   // 创建数据库
   try {
@@ -141,8 +142,7 @@ export async function apply(ctx: Context, config, session) {
   
   ctx.command('cs', '测试，开发专用')
     .action(async ({ session }) => {
-      await session.send("正在测试登录状态...");
-      const result = await test(ctx, ctx.puppeteer, 'https://x.com/xsjhsha/status/1957873302661390522', config);
+      await session.send("正在测试...");
     });
 
   ctx.command('twitter [...arg]', '根据url获得twitter推文截图')
@@ -155,64 +155,107 @@ export async function apply(ctx: Context, config, session) {
           // 判断x链接并获取内容
           await session.send("正在获取帖子截图...");
           logger.info('开始请求的推文连接：', url);
-          const shotcontent = await getScreenShot(ctx.puppeteer, url, config, ctx);
-          if (shotcontent.isVideo) {
-            console.log('此条推文为视频推文');
-            let textMsg = `这是一条视频推文：\n${shotcontent.word_content}\n`;
-            textMsg += `${h.image(shotcontent.screenshotBuffer, "image/webp")}`;
-            await session.send(textMsg);
-            if (shotcontent.mediaUrls && shotcontent.mediaUrls.length > 0) {
-              for (const videoUrl of shotcontent.mediaUrls) {
+          const tpTweet = await getTimePushedTweet(ctx, ctx.puppeteer, url, config);
+          // 判断是否为视频推文：如果tpTweet.mediaUrls中包含.mp4则为true
+          const isVideo = tpTweet.mediaUrls && tpTweet.mediaUrls.some(url => url.endsWith('.mp4'));
+          // 根据是否为视频推文构造不同的消息结构
+          if (isVideo) {
+            // 视频推文：先发送文字+截图
+            let textMsg = `发布了一条视频推文：\n${tpTweet.word_content}\n`;
+            textMsg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}`;
+            // 只收集图片
+            const imageUrls = tpTweet.mediaUrls.filter(url => !url.endsWith('.mp4'));
+            let images: string[] = [];
+            if (imageUrls.length > 0) {
+              const imagePromises = imageUrls.map(async (imageUrl) => {
                 let attempts = 0;
                 const maxRetries = 3;
                 while (attempts < maxRetries) {
                   try {
-                    const response = await ctx.http.get(videoUrl, {
+                    const response = await ctx.http.get(imageUrl, { 
                       responseType: 'arraybuffer',
-                      headers: {
+                      headers: { 
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                       }
                     });
-                    await session.send(h.video(response, 'video/mp4'));
-                    break;
+                    return h.image(response, 'image/jpeg');
                   } catch (error) {
                     attempts++;
-                    logger.error(`请求视频失败，正在尝试第 ${attempts} 次重试: ${videoUrl}`, error);
+                    logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
+                    if (attempts >= maxRetries) {
+                      logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
+                      return null;
+                    }
+                  }
+                }
+              });
+              images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+              textMsg += `${images.join('\n')}`;
+            }
+            // 只发送第一个 mp4 视频
+            const videoUrl = tpTweet.mediaUrls.find(url => url.endsWith('.mp4'));
+            let video_response;
+            if (videoUrl) {
+              let attempts = 0;
+              const maxRetries = 3;
+              while (attempts < maxRetries) {
+                try {
+                  video_response = await ctx.http.get(videoUrl, { 
+                    responseType: 'arraybuffer',
+                    headers: { 
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    }
+                  });
+                  if(config.outputLogs){
+                    logger.info(`成功请求视频文件: ${videoUrl}`);
+                  }
+                  break;
+                } catch (error) {
+                  attempts++;
+                  logger.error(`请求视频失败，正在尝试第 ${attempts} 次重试: ${videoUrl}`, error);
+                  if (attempts >= maxRetries) {
+                    logger.error(`请求视频失败，已达最大重试次数: ${videoUrl}`, error);
                   }
                 }
               }
             }
-          }else{
-            let textMsg = `这是一条图片推文：\n${shotcontent.word_content}\n`;
-            textMsg += `${h.image(shotcontent.screenshotBuffer, "image/webp")}`;
-            if (shotcontent.mediaUrls && shotcontent.mediaUrls.length > 0) {
-              const imagePromises = shotcontent.mediaUrls.map(async (imageUrl) => {
-                  let attempts = 0;
-                  const maxRetries = 3;
-                  while (attempts < maxRetries) {
-                      try {
-                          const response = await ctx.http.get(imageUrl, { 
-                              responseType: 'arraybuffer',
-                              headers: { 
-                                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+            await session.send(textMsg);
+            if (video_response) {
+              await session.send(h.video(video_response, 'video/mp4'));
+            }
+          } else {
+              // 图片推文
+              let msg = `发布了一条图片推文：\n${tpTweet.word_content}\n`;
+              msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
+              if (tpTweet.mediaUrls && tpTweet.mediaUrls.length > 0) {
+                  const imagePromises = tpTweet.mediaUrls.map(async (imageUrl) => {
+                      let attempts = 0;
+                      const maxRetries = 3;
+                      while (attempts < maxRetries) {
+                          try {
+                              const response = await ctx.http.get(imageUrl, { 
+                                  responseType: 'arraybuffer',
+                                  headers: { 
+                                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                                  }
+                              });
+                              return h.image(response, 'image/jpeg');
+                          } catch (error) {
+                              attempts++;
+                              logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
+                              if (attempts >= maxRetries) {
+                                  logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
+                                  return null;
                               }
-                          });
-                          return h.image(response, 'image/jpeg');
-                      } catch (error) {
-                          attempts++;
-                          logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                          if (attempts >= maxRetries) {
-                              logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                              return null;
                           }
                       }
-                  }
-              });
-              const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
-              textMsg += `${images.join('\n')}`;
-            }
-            await session.send(textMsg);
-          }
+                  });
+                  const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+                  msg += `${images.join('\n')}`;
+              }
+              await session.send(msg);
+          }       
         }
       } catch (error) {
         await session.send('获取推文内容失败', error);
@@ -243,12 +286,21 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries = 3) { // �
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
       // 等待推文容器渲染
       await page.waitForSelector('article', { timeout: 30000 });
-
-      // 获取推文文字内容
-      const word_content = await page.evaluate(() => {
-        const textEl = document.querySelector('div[data-testid="tweetText"]');
-        if (!textEl) return '';
-        return textEl.textContent.trim() || '';
+      // 等待推文内所有图片加载完成
+      await page.evaluate(async () => {
+        const article = document.querySelector('article[data-testid="tweet"]') || document.querySelector('article');
+        if (!article) return;
+        const imgs = Array.from(article.querySelectorAll('img'));
+        await Promise.all(imgs.map(img => {
+          if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+          return new Promise(resolve => {
+            img.onload = img.onerror = resolve;
+          });
+        }));
+      });
+      // 检查是否为受保护账号
+      const isProtected = await page.evaluate(() => {
+        return !!document.querySelector('[aria-label="受保护账号"]');
       });
 
       // 定位到推文容器进行截图
@@ -258,6 +310,20 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries = 3) { // �
       }
       const screenshotBuffer = await element.screenshot({ type: "webp" });
 
+      if (isProtected) {
+        // 受保护账号：只获取文字和截图，不返回媒体
+        const word_content = await page.evaluate(() => {
+          const el = document.querySelector('div[data-testid="tweetText"]');
+          return el ? el.textContent.trim() : '';
+        });
+        const element = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 });
+        const screenshotBuffer = element ? await element.screenshot({ type: "webp" }) : null;
+        return {
+          word_content: `${word_content}\n（注：此账号为受保护账号，故不提供具体媒体内容）`,
+          mediaUrls: [],
+          screenshotBuffer
+        };
+      }else {
       // 请求 vxtwitter API
       const apiUrl = url.replace(/(twitter\.com|x\.com)/, 'api.vxtwitter.com');
       console.log('请求 API URL:', apiUrl);
@@ -267,7 +333,7 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries = 3) { // �
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
           }
         });
-        console.log('成功接收到 vxtwitter API 的响应:');
+        console.log('成功接收到 vxtwitter API 的响应:', apiResponse);
         return {
           word_content: apiResponse.text,
           mediaUrls: apiResponse.media_extended ? apiResponse.media_extended.map(m => m.url) : [],
@@ -282,6 +348,7 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries = 3) { // �
            screenshotBuffer
          };
        }
+      }
     } catch (error) {
       attempts++;
       logger.error(`获取推文内容失败，正在尝试第 ${attempts} 次重试...`, error);
@@ -444,99 +511,129 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
           // 判断是否为视频推文：如果tpTweet.mediaUrls中包含.mp4则为true
           const isVideo = tpTweet.mediaUrls && tpTweet.mediaUrls.some(url => url.endsWith('.mp4'));
           // 根据config决定是否翻译推文
-            let tweetWord;
-            if (config.whe_translate === true && config.apiKey) {
-              const translation = await translate(tpTweet.word_content, ctx, config);
-              console.log('翻译结果', translation);
-              tweetWord = translation;
-            } else {
-              tweetWord = tpTweet.word_content;
+          let tweetWord;
+          if (config.whe_translate === true && config.apiKey) {
+            const translation = await translate(tpTweet.word_content, ctx, config);
+            console.log('翻译结果', translation);
+            tweetWord = translation;
+          } else {
+            tweetWord = tpTweet.word_content;
+          }
+
+          // 准备botkey
+          const botKey = `${config.platform}:${config.account}`;
+          
+          // 根据是否为视频推文构造不同的消息结构
+          if (isVideo) {
+            // 视频推文：先发送文字+截图
+            let textMsg = `【${id}】 发布了一条视频推文：\n${tweetWord}\n`;
+            if (isRetweet) {
+                textMsg += "[提醒：这是一条转发推文]\n";
+            }
+            textMsg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}`;
+            // 收集图片
+            const imageUrls = tpTweet.mediaUrls.filter(url => !url.endsWith('.mp4'));
+            let images: string[] = [];
+            if (imageUrls.length > 0) {
+              const imagePromises = imageUrls.map(async (imageUrl) => {
+                let attempts = 0;
+                const maxRetries = 3;
+                while (attempts < maxRetries) {
+                  try {
+                    const response = await ctx.http.get(imageUrl, { 
+                      responseType: 'arraybuffer',
+                      headers: { 
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                      }
+                    });
+                    return h.image(response, 'image/jpeg');
+                  } catch (error) {
+                    attempts++;
+                    logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
+                    if (attempts >= maxRetries) {
+                      logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
+                      return null;
+                    }
+                  }
+                }
+              });
+              images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+              textMsg += `${images.join('\n')}`;
+            }
+            // 单独发送mp4视频
+            const videoUrl = tpTweet.mediaUrls.find(url => url.endsWith('.mp4'));
+            let video_response;
+            if (videoUrl) {
+              let attempts = 0;
+              const maxRetries = 3;
+              while (attempts < maxRetries) {
+                try {
+                  video_response = await ctx.http.get(videoUrl, { 
+                    responseType: 'arraybuffer',
+                    headers: { 
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    }
+                  });
+                  if(config.outputLogs){
+                    logger.info(`成功请求视频文件: ${videoUrl}`);
+                  }
+                  break;
+                } catch (error) {
+                  attempts++;
+                  logger.error(`请求视频失败，正在尝试第 ${attempts} 次重试: ${videoUrl}`, error);
+                  if (attempts >= maxRetries) {
+                    logger.error(`请求视频失败，已达最大重试次数: ${videoUrl}`, error);
+                  }
+                }
+              }
             }
 
-            // 准备botkey
-            const botKey = `${config.platform}:${config.account}`;
-            // 根据是否为视频推文构造不同的消息结构
-            if (isVideo) {
-              console.log('此条推文为视频推文');
-              // 视频推文：先发送文字+截图
-              let textMsg = `【${id}】 发布了一条视频推文：\n${tweetWord}\n`;
+            await ctx.bots[botKey].sendMessage('702480563', textMsg);
+            if (video_response) {
+              await ctx.bots[botKey].sendMessage('702480563', h.video(video_response, 'video/mp4'));
+            }
+          } else {
+              // 图片推文
+              let msg = `【${id}】 发布了一条图片推文：\n${tweetWord}\n`;
               if (isRetweet) {
-                  textMsg += "[提醒：这是一条转发推文]\n";
+                  msg += "[提醒：这是一条转发推文]\n";
               }
-              textMsg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}`;
-              for (const groupId of groupID) {
-                  await ctx.bots[botKey].sendMessage(groupId, textMsg);
-              }
-              for (const groupId of groupID) {
-                if (tpTweet.mediaUrls && tpTweet.mediaUrls.length > 0) {
-                  for (const videoUrl of tpTweet.mediaUrls) {
+              msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
+              if (tpTweet.mediaUrls && tpTweet.mediaUrls.length > 0) {
+                  const imagePromises = tpTweet.mediaUrls.map(async (imageUrl) => {
                       let attempts = 0;
                       const maxRetries = 3;
                       while (attempts < maxRetries) {
                           try {
-                              const response = await ctx.http.get(videoUrl, { 
+                              const response = await ctx.http.get(imageUrl, { 
                                   responseType: 'arraybuffer',
                                   headers: { 
                                       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                                   }
                               });
-                              await ctx.bots[botKey].sendMessage(groupId, h.video(response, 'video/mp4'));
-                              logger.info(`test方法：成功向群 ${groupId} 发送视频文件`);
-                              break;
+                              return h.image(response, 'image/jpeg');
                           } catch (error) {
                               attempts++;
-                              logger.error(`请求视频失败，正在尝试第 ${attempts} 次重试: ${videoUrl}`, error);
+                              logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
                               if (attempts >= maxRetries) {
-                                  logger.error(`请求视频失败，已达最大重试次数: ${videoUrl}`, error);
-                                  break;
+                                  logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
+                                  return null;
                               }
                           }
                       }
-                  }
+                  });
+                  const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+                  msg += `${images.join('\n')}`;
               }
+              for (const groupId of groupID) {
+                  await ctx.bots[botKey].sendMessage(groupId, msg);
               }
-            } else {
-                // 图片推文
-                let msg = `【${id}】 发布了一条推文：\n${tweetWord}\n`;
-                if (isRetweet) {
-                    msg += "[提醒：这是一条转发推文]\n";
-                }
-                msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
-                if (tpTweet.mediaUrls && tpTweet.mediaUrls.length > 0) {
-                    const imagePromises = tpTweet.mediaUrls.map(async (imageUrl) => {
-                        let attempts = 0;
-                        const maxRetries = 3;
-                        while (attempts < maxRetries) {
-                            try {
-                                const response = await ctx.http.get(imageUrl, { 
-                                    responseType: 'arraybuffer',
-                                    headers: { 
-                                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                                    }
-                                });
-                                return h.image(response, 'image/jpeg');
-                            } catch (error) {
-                                attempts++;
-                                logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                                if (attempts >= maxRetries) {
-                                    logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                                    return null;
-                                }
-                            }
-                        }
-                    });
-                    const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
-                    msg += `${images.join('\n')}`;
-                }
-                for (const groupId of groupID) {
-                    await ctx.bots[botKey].sendMessage(groupId, msg);
-                }
-            }
-        }else {
-            if (config.outputLogs) {
-              logger.info(`已发送过博主 ${id} 的最新推文，跳过`);
-            }
           }
+      }else {
+          if (config.outputLogs) {
+            logger.info(`已发送过博主 ${id} 的最新推文，跳过`);
+          }
+        }
       } catch (error) {
         logger.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl}`, error);
         console.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl}`, error);
@@ -605,66 +702,6 @@ async function getTimeNow() {// 获得当前时间
   return formattedDate
 }
 
-async function getScreenShot(pptr, url, config, ctx) {// 获取指定x帖子截图
-  let attempts = 0;
-  let page;
-  const maxRetries = 3;
-  while (attempts < maxRetries) {
-    try {
-      page = await pptr.page();
-      await page.setCookie({ 
-        name: 'auth_token', 
-        value: `${config.cookies}`, 
-        domain: '.x.com', 
-        path: '/', 
-        httpOnly: true, 
-        secure: true 
-      });
-      await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36");
-      await page.setDefaultNavigationTimeout(60000);
-      await page.setDefaultTimeout(60000);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-      // 获取具体内容
-      const tpTweet = await getTimePushedTweet(ctx, ctx.puppeteer, url, config);
-      if (config.outputLogs) {
-        logger.info(`推文文字：${tpTweet.word_content}`);
-        logger.info('推文媒体url:', tpTweet.mediaUrls.map(url => url).join(', '));
-      }
-      // 判断是否为视频推文：如果tpTweet.mediaUrls中包含.mp4则为true
-      const isVideo = tpTweet.mediaUrls && tpTweet.mediaUrls.some(url => url.endsWith('.mp4'));
-      // 根据config决定是否翻译推文
-        let tweetWord;
-        if (config.whe_translate === true && config.apiKey) {
-          const translation = await translate(tpTweet.word_content, ctx, config);
-          console.log('翻译结果', translation);
-          tweetWord = translation;
-        } else {
-          tweetWord = tpTweet.word_content;
-        }
-        return {
-          word_content: tweetWord,
-          mediaUrls: tpTweet.mediaUrls,
-          screenshotBuffer: tpTweet.screenshotBuffer,
-          isVideo: isVideo
-        };
-    }catch (error) {
-      logger.error('获取截图失败', error);
-      attempts++;
-      if (attempts >= maxRetries) {
-        return {
-          word_content: '',
-          mediaUrls: [],
-          screenshotBuffer: null,
-          isVideo: false
-        };
-      }
-    }finally{
-      if (page) await page.close().catch(() => {});
-    }
-  }
-}
-
 async function translate(text: string, ctx, config) { // 翻译推文
   const url = config.apiurl + '/chat/completions';
   const model = config.model
@@ -691,38 +728,5 @@ async function translate(text: string, ctx, config) { // 翻译推文
   } catch (err) {
     logger.error('翻译失败，请检查api余额或检查api是否配置正确：', err);
     return '翻译失败，请检查api余额或检查api是否配置正确';
-  }
-}
-
-// const proxy_command = 'export http_proxy=http://127.0.0.1:7897';
-// const proxy_command2 = 'export https_proxy=http://127.0.0.1:7897';
-async function test(ctx, pptr, url, config, maxRetries = 3) { // 测试用例：抓取 x.com 最新推文
-  const tpTweet = await getTimePushedTweet(ctx, ctx.puppeteer, 'https://x.com/xsjhsha/status/1957873302661390522', config);
-  if (tpTweet.mediaUrls && tpTweet.mediaUrls.length > 0) {
-    for (const videoUrl of tpTweet.mediaUrls) {
-        let attempts = 0;
-        const maxRetries = 3;
-        while (attempts < maxRetries) {
-            try {
-                const response = await ctx.http.get(videoUrl, { 
-                    responseType: 'arraybuffer',
-                    headers: { 
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    }
-                });
-                const botKey = `${config.platform}:${config.account}`;
-                // 发送视频文件
-                await ctx.bots[botKey].sendMessage('702480563', h.video(response, 'video/mp4'));
-                break; // 成功下载，跳出重试循环
-            } catch (error) {
-                attempts++;
-                logger.error(`请求视频失败，正在尝试第 ${attempts} 次重试: ${videoUrl}`, error);
-                if (attempts >= maxRetries) {
-                    logger.error(`请求视频失败，已达最大重试次数: ${videoUrl}`, error);
-                    break;
-                }
-            }
-        }
-    }
   }
 }
