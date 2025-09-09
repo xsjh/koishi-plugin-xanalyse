@@ -43,12 +43,10 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.1.2</p>
+<p>1.1.5</p>
 <ul>
-<li>修复了同时存在图片视频的推文的推送问题</li>
-<li>修复了对受保护账号的推送</li>
-<li>修复了当获取推文链接失败时使该博主数据库导致的重复推送</li>
-<li>精简了部分代码</li>
+<li>修复了视频推文会固定发送至开发时使用的测试群聊的问题😅</li>
+<li>增加了api翻译自定义prompt功能，现在可以自定义你的翻译偏好</li>
 </ul>
 </div>
 <hr>
@@ -589,9 +587,11 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
               }
             }
 
-            await ctx.bots[botKey].sendMessage('702480563', textMsg);
-            if (video_response) {
-              await ctx.bots[botKey].sendMessage('702480563', h.video(video_response, 'video/mp4'));
+            for (const groupId of groupID) {
+              await ctx.bots[botKey].sendMessage(groupId, textMsg);
+              if (video_response) {
+                await ctx.bots[botKey].sendMessage(groupId, h.video(video_response, 'video/mp4'));
+              }
             }
           } else {
               // 图片推文
