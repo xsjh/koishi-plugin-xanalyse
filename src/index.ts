@@ -79,7 +79,8 @@ export const Config: Schema<Config> = Schema.intersect([
       whe_translate: Schema.const(true).required(),
       apiKey: Schema.string().required().description('deepseek apiKey密钥<br>点此链接了解👉https://platform.deepseek.com/api_keys'),
       apiurl: Schema.string().default('https://api.deepseek.com').description('默认为ds官方api接口，若使用siliconcloud平台请自行修改为https://api.siliconflow.cn/v1</br>'),
-      model: Schema.string().default('deepseek-chat').description('默认为ds官方模型，若要切换为siliconflow平台对应模型，请上滑页面查看Notice')
+      model: Schema.string().default('deepseek-chat').description('默认为ds官方模型，若要切换为siliconflow平台对应模型，请上滑页面查看Notice'),
+      prompt: Schema.string().role('textarea').default('翻译成简体中文，直接给出翻译结果，不要有多余输出不要修改标点符号，如果遇到网址或者空白内容请不要翻译，请翻译: {text}').description('翻译使用的提示词，使用{text}表示需要翻译的文本')
     }),
     Schema.object({}),
   ]),
@@ -713,7 +714,7 @@ async function translate(text: string, ctx, config) { // 翻译推文
     model: model,
     messages: [
       // { role: 'system', content: "你是一个翻译助手" },
-      { role: 'user', content: `翻译成简体中文，直接给出翻译结果，不要有多余输出不要修改标点符号，如果遇到网址或者空白内容请不要翻译，请翻译: ${text}` },
+      { role: 'user', content: config.prompt.replace('{text}', text) },
     ],
     stream: false,
   };
