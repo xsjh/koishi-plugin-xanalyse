@@ -87,6 +87,9 @@ export const Config: Schema<Config> = Schema.intersect([
     bloggers: Schema.array(Schema.object({
       id: Schema.string().description('Twitter博主用户名, 输@之后的用户名即可，不要加上@'),
       groupID: Schema.array(String).role('table').description('需要推送的群号'),
+      blacklist: Schema.array(Schema.string())
+      .description('需要屏蔽的违禁词')
+      .default([]),
     })).description('订阅的博主列表，例：elonmusk'),
   }).description('订阅的博主列表'),
 
@@ -137,11 +140,6 @@ export async function apply(ctx: Context, config, session) {
     .action(async ({ session }) => {
       await session.send("正在检查更新...");
       await checkTweets(session, config, ctx);
-    });
-  
-  ctx.command('cs', '测试，开发专用')
-    .action(async ({ session }) => {
-      await session.send("正在测试...");
     });
 
   ctx.command('twitter [...arg]', '根据url获得twitter推文截图')
@@ -517,6 +515,20 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
             tweetWord = translation;
           } else {
             tweetWord = tpTweet.word_content;
+          }
+
+          // 判断是否命中违禁词
+          if (blogger.blacklist && blogger.blacklist.length > 0) {
+            const lowerTweet = tweetWord.toLowerCase();
+            const lowerOriginal = tpTweet.word_content.toLowerCase();
+            const hitWords = blogger.blacklist.filter(word => {
+              const lowerWord = word.toLowerCase();
+              return lowerTweet.includes(lowerWord) || lowerOriginal.includes(lowerWord);
+            });
+            if (hitWords.length > 0) {
+              logger.info(`推文包含违禁词：${hitWords.join(', ')}，跳过推送`);
+              continue;
+            }
           }
 
           // 准备botkey
