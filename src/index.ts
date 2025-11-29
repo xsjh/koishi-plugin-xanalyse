@@ -43,10 +43,9 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.1.5</p>
+<p>1.2.0</p>
 <ul>
-<li>修复了视频推文会固定发送至开发时使用的测试群聊的问题😅</li>
-<li>增加了api翻译自定义prompt功能，现在可以自定义你的翻译偏好</li>
+<li>增加了违禁词识别功能</li>
 </ul>
 </div>
 <hr>
