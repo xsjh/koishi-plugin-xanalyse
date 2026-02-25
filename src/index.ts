@@ -19,7 +19,7 @@ export const usage = `
 <p>数据来源于 <a href="https://x.com" target="_blank">x.com</a></p>
 <hr>
 <h2>Tutorials</h2>
-<h3> ⭐️推文翻译功能需要前往<a href="https://platform.deepseek.com/usage" target="_blank">deepseek开放平台</a>申请API Keys并充值⭐️</h3>
+<h3> ⭐️推文翻译功能需要配置可用的 API Key，并确保对应服务账户可正常调用⭐️</h3>
 <h4>指令介绍：</h4>
 <p><b>twitter</b></p>
 <ul>
@@ -50,19 +50,7 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.3.0</p>
-<ul>
-<li>新增 X/Twitter 链接自动检测功能，可识别并自动处理消息中的推文链接</li>
-<li>新增图片 ALT 文本提取功能，自动获取推文图片的描述文字</li>
-<li>新增可配置消息前缀选项 <code>messagePrefix</code></li>
-<li>优化推文截图逻辑，改进头像区域检测</li>
-<li>调整图片描述原文显示位置至推文正文之后</li>
-<li>手动查询命令现支持翻译功能</li>
-</ul>
-<p>1.2.0</p>
-<ul>
-<li>增加了违禁词识别功能</li>
-</ul>
+<p>版本更新记录请参考顶部“插件主页”。</p>
 </div>
 <hr>
 <h2>⚠！重要告示！⚠</h2>
@@ -73,6 +61,39 @@ export const usage = `
 `;
 
 const DEFAULT_PROMPT = '你是精通日语与互联网文化的推文翻译专家。请将输入内容翻译为简体中文，仅输出译文，不要附加解释。可适度润色，但需保留原文格式（换行、段落、标点）。保留网址、emoji、#话题标签原样，不翻译人名或其代称。正确理解常见缩写与梗语（如 rkgk = 落書き）。若内容为空、仅含链接、仅占位符或无有效文本，请不要翻译并直接输出空内容。请翻译：{text}';
+const IMAGE_TRANSLATION_PROMPT_APPEND = [
+  '以下为补充强约束（优先于上文输出格式要求）：',
+  '你还会收到推文配图，请额外完成图片文字识别与翻译任务。',
+  '要求：',
+  '1. 按输入图片顺序输出每张图的“译文”和“原文”（先译文，后原文）。',
+  '2. 原文尽量保留识别到的原语言文本与行序；译文翻译为简体中文。',
+  '3. 若某张图片无可识别文字，则该图不输出任何条目。',
+  '4. 若本批全部图片都无可识别文字，则返回空字符串（不要输出任何文字）。',
+  '5. 仅输出以下结构，不要附加额外解释：',
+  '图片1译文：...',
+  '图片1原文：...',
+  '图片2译文：...',
+  '图片2原文：...'
+].join('\n');
+
+const ALT_TRANSLATION_PROMPT_APPEND = [
+  '以下为补充强约束（优先于上文输出格式要求）：',
+  '下面是推文图片 ALT 文本列表，请逐条翻译。',
+  '要求：',
+  '1. 仅输出翻译结果，按原编号顺序。',
+  '2. 格式为“ALT1译文：...”。',
+  '3. 无法翻译时保留原文。'
+].join('\n');
+const REQUEST_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const TWEET_ARTICLE_SELECTOR = 'article[data-testid="tweet"]';
+const BASE_SCREENSHOT_VIEWPORT = { width: 1280, height: 2200 };
+const SCREENSHOT_STABILITY_STYLE_ID = '__xanalyse_screenshot_stability_style__';
+const SCREENSHOT_OVERLAY_MARK_ATTR = 'data-xanalyse-hide-overlay';
+const SCREENSHOT_STABILITY_CSS = [
+  `[${SCREENSHOT_OVERLAY_MARK_ATTR}="1"] { visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }`,
+  '*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }',
+  'html { scroll-behavior: auto !important; }',
+].join('\n');
 
 export interface Config {
   account: string;
@@ -81,12 +102,18 @@ export interface Config {
   cookies: string;
   messagePrefix: string;
   fetchRetries: number;
+  screenshotExtraWaitMs?: number;
+  screenshotHighQualityMode?: boolean;
   whe_translate?: boolean;
   apiKey?: string;
   apiurl?: string;
   model?: string;
   prompt?: string;
   translateRetries?: number;
+  translationBilingual?: boolean;
+  llmImageInputEnabled?: boolean;
+  llmImageInputLimit?: number;
+  llmImageInputSizeLimitKB?: number;
   bloggers: Array<{
     id: string;
     groupID: string[];
@@ -103,19 +130,25 @@ export const Config = Schema.intersect([
     updateInterval: Schema.number().min(1).default(5).description('检查推文更新间隔时间（单位分钟），建议每多两个订阅增加1分钟'),
     cookies: Schema.string().required().description('x的登录cookies，获取方式往上翻看简介'),
     messagePrefix: Schema.string().default('获取了').description('推文消息前缀，例如"获取了"、"发布了"等'),
-    fetchRetries: Schema.number().min(1).default(3).description('抓取推文失败时的重试次数')
+    fetchRetries: Schema.number().min(1).default(3).description('抓取推文失败时的重试次数'),
+    screenshotExtraWaitMs: Schema.number().min(0).max(15000).default(1200).description('截图前额外等待时间（毫秒）：在页面就绪后再等待一段时间，降低图片未加载完整的概率'),
+    screenshotHighQualityMode: Schema.boolean().default(false).description('高质量模式：开启后截图使用 deviceScaleFactor=2（更清晰但更耗时）')
   }).description('基础设置'),
 
   Schema.object({
-    whe_translate: Schema.boolean().default(false).description('是否启用推文翻译（接入deepseek v3）')
+    whe_translate: Schema.boolean().default(false).description('是否启用推文翻译'),
+    translationBilingual: Schema.boolean().default(true).description('翻译结果显示模式：开启为双语（译文+原文），关闭为仅译文'),
+    llmImageInputEnabled: Schema.boolean().default(false).description('LLM输入图片支持：开启后将推文图片一并送入LLM翻译'),
+    llmImageInputLimit: Schema.number().min(1).max(10).default(2).description('LLM输入图片数量限制：单次请求最多附带图片张数（超出后分批）'),
+    llmImageInputSizeLimitKB: Schema.number().min(64).default(1024).description('LLM输入图片尺寸限制（KB）：超出后将先压缩再发送')
   }).description('翻译设置'),
 
   Schema.union([
     Schema.object({
       whe_translate: Schema.const(true).required(),
-      apiKey: Schema.string().required().description('deepseek apiKey密钥<br>点此链接了解👉https://platform.deepseek.com/api_keys'),
-      apiurl: Schema.string().default('https://api.deepseek.com').description('默认为ds官方api接口，支持任意 OpenAI 兼容格式的第三方服务'),
-      model: Schema.string().default('deepseek-chat').description('默认为ds官方模型，可根据使用的API服务自行修改'),
+      apiKey: Schema.string().required().description('翻译服务 API Key'),
+      apiurl: Schema.string().default('https://api.deepseek.com').description('翻译服务 API 地址（支持 OpenAI 兼容格式）'),
+      model: Schema.string().default('deepseek-chat').description('翻译模型名称（根据所用服务填写）'),
       prompt: Schema.string().role('textarea').default(DEFAULT_PROMPT).description('翻译使用的提示词，使用{text}表示需要翻译的文本'),
       translateRetries: Schema.number().min(1).default(3).description('翻译接口失败时的重试次数')
     }),
@@ -153,6 +186,22 @@ export interface Xanalyse {
 export interface LatestResult {
   tweets: Array<{ link: string; isRetweet: boolean; isVideo: boolean }>;
   word_content: string;
+}
+
+interface TweetDetailResult {
+  word_content: string;
+  altTexts: string[];
+  mediaUrls: string[];
+  screenshotBuffer: Buffer | null;
+}
+
+interface TweetTranslationBundle {
+  textOriginal: string;
+  textTranslated: string;
+  altOriginalList: string[];
+  altTranslated: string;
+  imageOriginal: string;
+  imageTranslated: string;
 }
 
 
@@ -198,87 +247,43 @@ export async function apply(ctx: Context, config, session) {
       }
       const tweetText = tpTweet.word_content ?? '';
       const mediaUrls = tpTweet.mediaUrls || [];
+      const altTexts = tpTweet.altTexts || [];
+      const mediaBufferCache = new Map<string, Buffer>();
       const isVideo = mediaUrls.some((u) => u.endsWith(".mp4"));
-      // 构建 ALT 原文显示部分
-      let altOriginalText = "";
-      if (tpTweet.altTexts && tpTweet.altTexts.length > 0) {
-        altOriginalText = "\n" + tpTweet.altTexts.map((alt, i) => `[图片${tpTweet.altTexts.length > 1 ? (i + 1) : ""}描述原文: ${alt}]`).join("\n");
-      }
-      // 根据config决定是否翻译推文
-      let tweetWord;
-      if (config.whe_translate === true && config.apiKey) {
-        try {
-          const translation_result = await translate(tweetText, ctx, config);
-          if (config.outputLogs) {
-            logger.info("手动查询翻译结果：", translation_result);
-          }
-          tweetWord = translation_result;
-        } catch (err) {
-          logger.error("手动翻译失败，返回原文：", err);
-          tweetWord = tweetText;
-        }
-      } else {
-        tweetWord = tweetText;
-      }
+      const translationBundle = await buildTweetTranslationBundle({
+        textOriginal: tweetText,
+        altOriginalList: altTexts,
+        mediaUrls,
+        mediaBufferCache,
+        ctx,
+        config,
+      });
       // 根据是否为视频推文构造不同的消息结构
       if (isVideo) {
         // 视频推文：先发送文字+截图
-        let textMsg = `${config.messagePrefix}一条视频推文：\n${tweetWord}${altOriginalText}\n`;
+        let textMsg = buildTweetIntroMessage({
+          messagePrefix: config.messagePrefix,
+          isVideo: true,
+          bundle: translationBundle,
+          isRetweet: false,
+          showTranslationSections: isTranslateEnabled(config),
+          bilingualOutput: isBilingualOutput(config),
+        });
+        textMsg += "\n";
         textMsg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}`;
         // 只收集图片
         const imageUrls = mediaUrls.filter((u) => !u.endsWith('.mp4'));
-        let images: string[] = [];
         if (imageUrls.length > 0) {
-          const imagePromises = imageUrls.map(async (imageUrl) => {
-            let attempts = 0;
-            const maxRetries = 3;
-            while (attempts < maxRetries) {
-              try {
-                const response = await ctx.http.get(imageUrl, {
-                  responseType: 'arraybuffer',
-                  headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                  }
-                });
-                return h.image(response, 'image/jpeg');
-              } catch (error) {
-                attempts++;
-                logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                if (attempts >= maxRetries) {
-                  logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                  return null;
-                }
-              }
-            }
-          });
-          images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+          const images = await buildImageElementsFromUrls(ctx, imageUrls, config, mediaBufferCache);
           textMsg += `${images.join('\n')}`;
         }
         // 只发送第一个 mp4 视频
         const videoUrl = mediaUrls.find((u) => u.endsWith('.mp4'));
-        let video_response;
+        let video_response: Buffer | null = null;
         if (videoUrl) {
-          let attempts = 0;
-          const maxRetries = 3;
-          while (attempts < maxRetries) {
-            try {
-              video_response = await ctx.http.get(videoUrl, {
-                responseType: 'arraybuffer',
-                headers: {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-              });
-              if (config.outputLogs) {
-                logger.info(`成功请求视频文件: ${videoUrl}`);
-              }
-              break;
-            } catch (error) {
-              attempts++;
-              logger.error(`请求视频失败，正在尝试第 ${attempts} 次重试: ${videoUrl}`, error);
-              if (attempts >= maxRetries) {
-                logger.error(`请求视频失败，已达最大重试次数: ${videoUrl}`, error);
-              }
-            }
+          video_response = await fetchBinaryWithRetry(ctx, videoUrl, config, 3, '视频');
+          if (video_response && config.outputLogs) {
+            logger.info(`成功请求视频文件: ${videoUrl}`);
           }
         }
         await sessionParam.send(textMsg);
@@ -287,32 +292,18 @@ export async function apply(ctx: Context, config, session) {
         }
       } else {
         // 图片推文
-        let msg = `${config.messagePrefix}一条图片推文：\n${tweetWord}${altOriginalText}\n`;
+        let msg = buildTweetIntroMessage({
+          messagePrefix: config.messagePrefix,
+          isVideo: false,
+          bundle: translationBundle,
+          isRetweet: false,
+          showTranslationSections: isTranslateEnabled(config),
+          bilingualOutput: isBilingualOutput(config),
+        });
+        msg += "\n";
         msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
         if (mediaUrls.length > 0) {
-          const imagePromises = mediaUrls.map(async (imageUrl) => {
-            let attempts = 0;
-            const maxRetries = 3;
-            while (attempts < maxRetries) {
-              try {
-                const response = await ctx.http.get(imageUrl, {
-                  responseType: 'arraybuffer',
-                  headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                  }
-                });
-                return h.image(response, 'image/jpeg');
-              } catch (error) {
-                attempts++;
-                logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                if (attempts >= maxRetries) {
-                  logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                  return null;
-                }
-              }
-            }
-          });
-          const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+          const images = await buildImageElementsFromUrls(ctx, mediaUrls, config, mediaBufferCache);
           msg += `${images.join('\n')}`;
         }
         await sessionParam.send(msg);
@@ -379,6 +370,7 @@ export async function apply(ctx: Context, config, session) {
       if (!config || config.detectXLinks === false) return next();
       const text = session2.content || '';
       if (!text) return next();
+      if (isManualTwitterCommandMessage(text)) return next();
       const candidates = extractUrls(text);
       if (!candidates.length) return next();
       const found: string[] = [];
@@ -391,10 +383,11 @@ export async function apply(ctx: Context, config, session) {
           found.push(normalized);
         }
       }
-      if (found.length) {
-        logger.info('检测到 X/Twitter 链接:', found);
+      const uniqueFound = Array.from(new Set(found));
+      if (uniqueFound.length) {
+        logger.info('检测到 X/Twitter 链接:', uniqueFound);
         // 对检测到的链接执行与命令相同的处理流程
-        for (const link of found) {
+        for (const link of uniqueFound) {
           try {
             await processTwitterUrl(session2, link);
           } catch (e) {
@@ -409,7 +402,1007 @@ export async function apply(ctx: Context, config, session) {
   });
 }
 
-async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number) { // 获取需要推送的推文具体内容
+type ChatRole = 'system' | 'user' | 'assistant';
+
+interface ChatMessage {
+  role: ChatRole;
+  content: any;
+}
+
+interface BuildTranslationBundleParams {
+  textOriginal: string;
+  altOriginalList: string[];
+  mediaUrls: string[];
+  mediaBufferCache?: Map<string, Buffer>;
+  ctx: Context;
+  config: Config;
+}
+
+interface BuildIntroMessageParams {
+  heading?: string;
+  messagePrefix: string;
+  isVideo: boolean;
+  bundle: TweetTranslationBundle;
+  isRetweet?: boolean;
+  showTranslationSections: boolean;
+  bilingualOutput: boolean;
+}
+
+interface PreparedImageForLLM {
+  index: number;
+  sourceUrl: string;
+  originalBytes: number;
+  finalBytes: number;
+  dataUrl: string;
+}
+
+interface ImageTranslationResult {
+  translated: string;
+  original: string;
+  raw: string;
+}
+
+function isTranslateEnabled(config: Config): boolean {
+  return config?.whe_translate === true && !!config?.apiKey;
+}
+
+function isBilingualOutput(config: Config): boolean {
+  return config?.translationBilingual !== false;
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getScreenshotExtraWaitMs(config: Config): number {
+  const raw = Number(config?.screenshotExtraWaitMs ?? 1200);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.floor(raw);
+}
+
+async function waitBeforeScreenshot(config: Config, scene: string) {
+  const extraWaitMs = getScreenshotExtraWaitMs(config);
+  if (extraWaitMs <= 0) return;
+  if (config.outputLogs) {
+    logger.info(`[截图等待] ${scene}，额外等待 ${extraWaitMs}ms`);
+  }
+  await sleep(extraWaitMs);
+}
+
+function getScreenshotViewport(config: Config) {
+  const deviceScaleFactor = config?.screenshotHighQualityMode ? 2 : 1;
+  return {
+    ...BASE_SCREENSHOT_VIEWPORT,
+    deviceScaleFactor,
+  };
+}
+
+async function applyStableScreenshotViewport(page: any, config: Config) {
+  const viewport = getScreenshotViewport(config);
+  await page.setViewport(viewport);
+  if (config.outputLogs) {
+    logger.info('[截图参数] 使用固定 viewport', viewport);
+  }
+}
+
+async function waitForTweetImagesLoaded(page: any, selector: string) {
+  await page.waitForFunction((sel) => {
+    const root = document.querySelector(sel);
+    if (!root) return false;
+    const imgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[];
+    return imgs.every((img) => img.complete && img.naturalWidth > 0);
+  }, { timeout: 8000 }, selector);
+}
+
+async function waitForStableElementBox(element: any, samples = 6, intervalMs = 120) {
+  let lastBox: any = null;
+  let stableCount = 0;
+  for (let i = 0; i < samples; i++) {
+    const box = await element.boundingBox();
+    if (box && box.width > 40 && box.height > 40) {
+      if (
+        lastBox &&
+        Math.abs(box.x - lastBox.x) < 1 &&
+        Math.abs(box.y - lastBox.y) < 1 &&
+        Math.abs(box.width - lastBox.width) < 1 &&
+        Math.abs(box.height - lastBox.height) < 1
+      ) {
+        stableCount += 1;
+        if (stableCount >= 2) return box;
+      } else {
+        stableCount = 0;
+      }
+      lastBox = box;
+    }
+    await sleep(intervalMs);
+  }
+  return lastBox;
+}
+
+function clampClipToViewport(box: any, viewport: any, pad = 12) {
+  if (!box || !viewport) return null;
+  const left = Math.max(0, Math.floor(box.x - pad));
+  const top = Math.max(0, Math.floor(box.y - pad));
+  const right = Math.min(viewport.width, Math.ceil(box.x + box.width + pad));
+  const bottom = Math.min(viewport.height, Math.ceil(box.y + box.height + pad));
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 1 || height <= 1) return null;
+  return { x: left, y: top, width, height };
+}
+
+async function installScreenshotVisualGuards(page: any, config: Config): Promise<() => Promise<void>> {
+  try {
+    await page.evaluate((tweetSelector, styleId, markAttr, cssText) => {
+      const prevMarked = Array.from(document.querySelectorAll(`[${markAttr}]`));
+      for (const node of prevMarked) {
+        node.removeAttribute(markAttr);
+      }
+
+      const tweet = document.querySelector(tweetSelector);
+      const candidates = Array.from(document.querySelectorAll('body *'));
+      for (const node of candidates) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (!node.isConnected) continue;
+        if (tweet && (node === tweet || node.contains(tweet) || tweet.contains(node))) continue;
+
+        const role = (node.getAttribute('role') || '').toLowerCase();
+        const ariaModal = (node.getAttribute('aria-modal') || '').toLowerCase();
+        const testId = (node.getAttribute('data-testid') || '').toLowerCase();
+        const className = typeof node.className === 'string' ? node.className.toLowerCase() : '';
+        const computed = window.getComputedStyle(node);
+        const position = computed.position;
+        const zIndex = Number.parseInt(computed.zIndex || '0', 10);
+        const rect = node.getBoundingClientRect();
+        const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+
+        const isFloating = (position === 'fixed' || position === 'sticky') && area >= 1600;
+        const isDialogLike = ariaModal === 'true' || role === 'dialog' || role === 'alertdialog';
+        const isTransientLayer = testId.includes('modal')
+          || testId.includes('sheetdialog')
+          || testId.includes('hovercard')
+          || testId.includes('toast');
+        const isHighZFloating = isFloating && Number.isFinite(zIndex) && zIndex >= 1000;
+        const isFloatingSkeleton = isFloating && (className.includes('skeleton') || className.includes('shimmer') || className.includes('loading'));
+
+        if (isDialogLike || isTransientLayer || isHighZFloating || isFloatingSkeleton) {
+          node.setAttribute(markAttr, '1');
+        }
+      }
+
+      let style = document.getElementById(styleId) as HTMLStyleElement | null;
+      if (!style) {
+        style = document.createElement('style');
+        style.id = styleId;
+        (document.head || document.documentElement).appendChild(style);
+      }
+      style.textContent = cssText;
+    }, TWEET_ARTICLE_SELECTOR, SCREENSHOT_STABILITY_STYLE_ID, SCREENSHOT_OVERLAY_MARK_ATTR, SCREENSHOT_STABILITY_CSS);
+    if (config.outputLogs) {
+      logger.info('[截图流程] 已启用浮层隐藏与动画冻结');
+    }
+  } catch (err) {
+    if (config.outputLogs) {
+      logger.warn('[截图流程] 启用浮层隐藏失败，继续原流程', err);
+    }
+  }
+
+  return async () => {
+    try {
+      await page.evaluate((styleId, markAttr) => {
+        document.getElementById(styleId)?.remove();
+        const marked = Array.from(document.querySelectorAll(`[${markAttr}]`));
+        for (const node of marked) {
+          node.removeAttribute(markAttr);
+        }
+      }, SCREENSHOT_STABILITY_STYLE_ID, SCREENSHOT_OVERLAY_MARK_ATTR);
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.warn('[截图流程] 恢复页面临时样式失败', err);
+      }
+    }
+  };
+}
+
+async function captureTweetScreenshot(page: any, config: Config, scene: string): Promise<Buffer | null> {
+  const element = await page.waitForSelector(TWEET_ARTICLE_SELECTOR, { timeout: 15000 });
+  if (!element) return null;
+  const restoreVisualGuards = await installScreenshotVisualGuards(page, config);
+
+  try {
+    try {
+      await element.evaluate((el) => {
+        el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+      });
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.warn(`[截图流程] ${scene} 滚动定位失败，继续尝试截图`, err);
+      }
+    }
+
+    try {
+      await waitForTweetImagesLoaded(page, TWEET_ARTICLE_SELECTOR);
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.info(`[截图流程] ${scene} 图片等待超时，按当前渲染结果继续`);
+      }
+    }
+
+    const stableBox = await waitForStableElementBox(element);
+    await waitBeforeScreenshot(config, scene);
+
+    try {
+      const buf = await element.screenshot({ type: 'webp' });
+      if (config.outputLogs) {
+        logger.info(`[截图流程] ${scene} 使用元素截图成功`, {
+          width: stableBox?.width || 0,
+          height: stableBox?.height || 0,
+        });
+      }
+      return buf;
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.warn(`[截图流程] ${scene} 元素截图失败，回退到 clip 截图`, err);
+      }
+    }
+
+    const viewport = page.viewport?.();
+    const box = stableBox || await element.boundingBox();
+    const clip = clampClipToViewport(box, viewport);
+    if (!clip) return null;
+
+    const fallback = await page.screenshot({
+      clip,
+      type: 'webp',
+      captureBeyondViewport: true,
+    });
+    if (config.outputLogs) {
+      logger.info(`[截图流程] ${scene} 使用 clip 回退截图成功`, clip);
+    }
+    return fallback;
+  } finally {
+    await restoreVisualGuards();
+  }
+}
+
+function isManualTwitterCommandMessage(content: string): boolean {
+  const trimmed = toNonEmptyString(content);
+  if (!trimmed) return false;
+  return /^\/?twitter(?:\s|$)/i.test(trimmed);
+}
+
+function toNonEmptyString(input: any): string {
+  return typeof input === 'string' ? input.trim() : '';
+}
+
+function isTcoUrlToken(token: string): boolean {
+  const cleaned = token
+    .replace(/^[\(\[【<"'`]+/, '')
+    .replace(/[\)\]】>"'`,.;:!?，。？！、]+$/g, '');
+  if (!/^https?:\/\//i.test(cleaned)) return false;
+  try {
+    const u = new URL(cleaned);
+    return (u.hostname || '').toLowerCase() === 't.co';
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTweetTextFromApi(rawText: string, mediaCount: number, outputLogs?: boolean): string {
+  const text = toNonEmptyString(rawText);
+  if (!text) return '';
+  if (mediaCount <= 0) return text;
+  const tokens = text.split(/\s+/).map(t => t.trim()).filter(Boolean);
+  if (!tokens.length) return '';
+  const placeholderOnly = tokens.every(isTcoUrlToken);
+  if (!placeholderOnly) return text;
+  if (outputLogs) {
+    logger.info('[正文清洗] 检测到仅含 t.co 媒体占位链接，已清空正文', { mediaCount, text });
+  }
+  return '';
+}
+
+function getPromptTemplate(config: Config): string {
+  return (config.prompt && config.prompt.trim()) ? config.prompt : DEFAULT_PROMPT;
+}
+
+function fillPromptTemplate(promptTemplate: string, text: string): string {
+  const safeText = text ?? '';
+  if (promptTemplate.includes('{text}')) {
+    return promptTemplate.replace('{text}', safeText);
+  }
+  return `${promptTemplate}\n${safeText}`;
+}
+
+function chunkArray<T>(items: T[], chunkSize: number): T[][] {
+  const safeSize = Math.max(1, Math.floor(chunkSize || 1));
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += safeSize) {
+    chunks.push(items.slice(i, i + safeSize));
+  }
+  return chunks;
+}
+
+function detectImageMime(buffer: Buffer): string {
+  if (!buffer || buffer.length < 12) return 'image/jpeg';
+  if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'image/jpeg';
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return 'image/png';
+  if (
+    buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+    buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50
+  ) return 'image/webp';
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) return 'image/gif';
+  return 'image/jpeg';
+}
+
+function extractOriginalTweetImageUrlsForLLM(mediaUrls: string[], config?: Config): string[] {
+  const result = (mediaUrls || []).filter((url) => {
+    if (!url || typeof url !== 'string') return false;
+    const trimmed = url.trim();
+    if (!trimmed) return false;
+    const lower = trimmed.toLowerCase();
+    if (!/^https?:\/\//.test(lower)) return false;
+    if (lower.startsWith('data:')) return false;
+    if (lower.endsWith('.mp4')) return false;
+    return true;
+  });
+  if (config?.outputLogs) {
+    logger.info('[LLM输入图片] 图片来源约束：仅使用推文原始 mediaUrls，不包含 Puppeteer 截图', {
+      mediaUrlCount: (mediaUrls || []).length,
+      selectedCount: result.length,
+    });
+  }
+  return result;
+}
+
+function isNoTextImageMarker(value: string): boolean {
+  const normalized = toNonEmptyString(value).replace(/\s+/g, '');
+  if (!normalized) return true;
+  return /^(?:无可识别文字|无可识别文本|无文字|无文本|none|n\/a|na|空|（无可识别文字）)$/.test(normalized.toLowerCase());
+}
+
+function isNoTextImageResponse(value: string): boolean {
+  const source = toNonEmptyString(value);
+  if (!source) return true;
+  const lines = source
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => line.replace(/^[\-\*\d\.\)\(【\[\]：:\s]+/, '').trim());
+  if (!lines.length) return true;
+  return lines.every(line => {
+    if (isNoTextImageMarker(line)) return true;
+    return /无可识别文字|无可识别文本|无文字|no\s*text|no\s*readable\s*text/i.test(line);
+  });
+}
+
+function parseImageFieldLine(rawLine: string): { index: number; field: 'translated' | 'original'; value: string } | null {
+  const line = toNonEmptyString(rawLine)
+    .replace(/^[\-\*\u2022]+\s*/, '')
+    .trim();
+  if (!line) return null;
+
+  const indexedColon = line.match(/^图片\s*(\d+)\s*(译文|原文)\s*(?:[:：]\s*(.*))?$/);
+  if (indexedColon) {
+    return {
+      index: Number(indexedColon[1]),
+      field: indexedColon[2] === '译文' ? 'translated' : 'original',
+      value: (indexedColon[3] || '').trim(),
+    };
+  }
+
+  const indexedBracket = line.match(/^[\[\【]\s*图片\s*(\d+)\s*(译文|原文)\s*[\]\】]\s*(?:[:：]\s*(.*))?$/);
+  if (indexedBracket) {
+    return {
+      index: Number(indexedBracket[1]),
+      field: indexedBracket[2] === '译文' ? 'translated' : 'original',
+      value: (indexedBracket[3] || '').trim(),
+    };
+  }
+
+  const singleColon = line.match(/^图片\s*(译文|原文)\s*(?:[:：]\s*(.*))?$/);
+  if (singleColon) {
+    return {
+      index: 1,
+      field: singleColon[1] === '译文' ? 'translated' : 'original',
+      value: (singleColon[2] || '').trim(),
+    };
+  }
+
+  const singleBracket = line.match(/^[\[\【]\s*图片\s*(译文|原文)\s*[\]\】]\s*(?:[:：]\s*(.*))?$/);
+  if (singleBracket) {
+    return {
+      index: 1,
+      field: singleBracket[1] === '译文' ? 'translated' : 'original',
+      value: (singleBracket[2] || '').trim(),
+    };
+  }
+
+  return null;
+}
+
+function parseImageTranslationResult(text: string): ImageTranslationResult {
+  const source = toNonEmptyString(text);
+  if (!source) return { translated: '', original: '', raw: '' };
+  const lines = source.split('\n');
+  const rows = new Map<number, { translated?: string; original?: string }>();
+  let lastHit: { index: number; field: 'translated' | 'original' } | null = null;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^第\s*\d+\s*批/.test(line)) continue;
+    const parsedField = parseImageFieldLine(line);
+    if (parsedField) {
+      const { index, field, value } = parsedField;
+      const prev = rows.get(index) || {};
+      prev[field] = value;
+      rows.set(index, prev);
+      lastHit = { index, field };
+      continue;
+    }
+    if (lastHit) {
+      const prev = rows.get(lastHit.index) || {};
+      prev[lastHit.field] = `${prev[lastHit.field] || ''}\n${line}`.trim();
+      rows.set(lastHit.index, prev);
+    }
+  }
+
+  if (!rows.size) {
+    if (isNoTextImageResponse(source)) {
+      return {
+        translated: '',
+        original: '',
+        raw: source,
+      };
+    }
+    return {
+      translated: source,
+      original: '',
+      raw: source,
+    };
+  }
+
+  const sortedIndexes = Array.from(rows.keys()).sort((a, b) => a - b);
+  const translatedLines: string[] = [];
+  const originalLines: string[] = [];
+  for (const index of sortedIndexes) {
+    const row = rows.get(index) || {};
+    if (row.translated && !isNoTextImageMarker(row.translated)) {
+      translatedLines.push(`图片${index}译文：${row.translated}`);
+    }
+    if (row.original && !isNoTextImageMarker(row.original)) {
+      originalLines.push(`图片${index}原文：${row.original}`);
+    }
+  }
+  return {
+    translated: translatedLines.join('\n').trim(),
+    original: originalLines.join('\n').trim(),
+    raw: source,
+  };
+}
+
+function parseIndexedImageFieldBlocks(text: string, fieldLabel: '译文' | '原文'): Array<{ index: number; content: string }> {
+  const source = toNonEmptyString(text);
+  if (!source) return [];
+  const lines = source.split('\n');
+  const rows = new Map<number, string>();
+  let lastIndex: number | null = null;
+  const targetField = fieldLabel === '译文' ? 'translated' : 'original';
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parsedField = parseImageFieldLine(line);
+    if (parsedField) {
+      if (parsedField.field === targetField) {
+        rows.set(parsedField.index, parsedField.value);
+        lastIndex = parsedField.index;
+      } else {
+        lastIndex = null;
+      }
+      continue;
+    }
+    if (lastIndex !== null) {
+      rows.set(lastIndex, `${rows.get(lastIndex) || ''}\n${line}`.trim());
+    }
+  }
+
+  if (!rows.size) {
+    return [];
+  }
+
+  return Array.from(rows.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, content]) => ({ index, content: toNonEmptyString(content) }))
+    .filter(item => !!item.content);
+}
+
+function formatImageTranslatedSections(imageTranslated: string): string[] {
+  const blocks = parseIndexedImageFieldBlocks(imageTranslated, '译文');
+  if (!blocks.length) return [];
+  if (blocks.length === 1) {
+    return ['[图片译文]', blocks[0].content];
+  }
+  const lines: string[] = [];
+  for (const [position, block] of blocks.entries()) {
+    if (position > 0) {
+      lines.push('');
+    }
+    lines.push(`[图片${block.index}译文]`);
+    lines.push(block.content);
+  }
+  return lines;
+}
+
+function summarizeMessages(messages: ChatMessage[]) {
+  let imageCount = 0;
+  for (const msg of messages) {
+    if (Array.isArray(msg?.content)) {
+      imageCount += msg.content.filter(item => item?.type === 'image_url').length;
+    }
+  }
+  return {
+    messageCount: messages.length,
+    imageCount,
+  };
+}
+
+async function callLLM(messages: ChatMessage[], ctx: Context, config: Config, scene: string): Promise<string> {
+  const url = `${config.apiurl}/chat/completions`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${config.apiKey}`,
+  };
+  const retryLimit = Math.max(1, config.translateRetries ?? 3);
+  let attempts = 0;
+
+  while (attempts < retryLimit) {
+    try {
+      if (config.outputLogs) {
+        logger.info(`[${scene}] 准备调用翻译模型`, {
+          url,
+          model: config.model,
+          ...summarizeMessages(messages),
+        });
+      }
+      const response = await ctx.http.post(url, {
+        model: config.model,
+        messages,
+        stream: false,
+      }, { headers });
+      const rawContent = response?.choices?.[0]?.message?.content;
+      const textContent = typeof rawContent === 'string'
+        ? rawContent
+        : Array.isArray(rawContent)
+          ? rawContent.map(item => item?.text || '').join('\n')
+          : '';
+      const parsed = toNonEmptyString(textContent);
+      if (config.outputLogs) {
+        logger.info(`[${scene}] 模型调用完成`, {
+          contentLength: parsed.length,
+          hasChoices: !!response?.choices,
+        });
+      }
+      return parsed;
+    } catch (err) {
+      attempts++;
+      logger.error(`[${scene}] 调用失败，正在尝试第 ${attempts} 次重试...`, err);
+      if (attempts >= retryLimit) {
+        logger.error(`[${scene}] 已达最大重试次数`, err);
+        return '';
+      }
+      await sleep(1000 * attempts);
+    }
+  }
+  return '';
+}
+
+async function translateText(text: string, ctx: Context, config: Config, scene = '正文翻译'): Promise<string> {
+  const source = toNonEmptyString(text);
+  if (!source || !isTranslateEnabled(config)) return '';
+  const prompt = fillPromptTemplate(getPromptTemplate(config), source);
+  return callLLM([{ role: 'user', content: prompt }], ctx, config, scene);
+}
+
+async function fetchBinaryWithRetry(
+  ctx: Context,
+  mediaUrl: string,
+  config: Config,
+  maxRetries = 3,
+  mediaKind = '图片',
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<Buffer | null> {
+  if (mediaBufferCache?.has(mediaUrl)) {
+    const cached = mediaBufferCache.get(mediaUrl) || null;
+    if (cached && config.outputLogs) {
+      logger.info(`[${mediaKind}] 命中缓存`, { mediaUrl, bytes: cached.length });
+    }
+    if (cached) return cached;
+  }
+  let attempts = 0;
+  while (attempts < Math.max(1, maxRetries)) {
+    try {
+      const response = await ctx.http.get(mediaUrl, {
+        responseType: 'arraybuffer',
+        headers: {
+          'User-Agent': REQUEST_USER_AGENT,
+        }
+      });
+      const buffer = Buffer.isBuffer(response) ? response : Buffer.from(response);
+      if (mediaBufferCache) {
+        mediaBufferCache.set(mediaUrl, buffer);
+      }
+      if (config.outputLogs) {
+        logger.info(`[${mediaKind}] 下载成功`, { mediaUrl, bytes: buffer.length });
+      }
+      return buffer;
+    } catch (error) {
+      attempts++;
+      logger.error(`[${mediaKind}] 下载失败，正在尝试第 ${attempts} 次重试: ${mediaUrl}`, error);
+      if (attempts >= Math.max(1, maxRetries)) {
+        logger.error(`[${mediaKind}] 下载失败，已达最大重试次数: ${mediaUrl}`, error);
+        return null;
+      }
+      await sleep(800 * attempts);
+    }
+  }
+  return null;
+}
+
+async function buildImageElementsFromUrls(
+  ctx: Context,
+  urls: string[],
+  config: Config,
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<any[]> {
+  const imagePromises = urls.map(async (imageUrl) => {
+    const buffer = await fetchBinaryWithRetry(ctx, imageUrl, config, 3, '图片', mediaBufferCache);
+    if (!buffer) return null;
+    const img = h.image(buffer, detectImageMime(buffer));
+    if (!img && config.outputLogs) {
+      logger.warn("图片转码结果为空，image_url:", imageUrl);
+    }
+    return img;
+  });
+  return (await Promise.all(imagePromises)).filter(item => !!item);
+}
+
+async function compressImageToLimit(pptr: any, inputBuffer: Buffer, maxBytes: number, config: Config, tag: string): Promise<Buffer | null> {
+  if (!inputBuffer) return null;
+  if (inputBuffer.length <= maxBytes) return inputBuffer;
+  let page;
+  try {
+    page = await pptr.page();
+    const result = await page.evaluate(async (args) => {
+      const { base64, inputMime, maxBytes } = args;
+      const dataUrl = `data:${inputMime};base64,${base64}`;
+      const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('image-load-failed'));
+        img.src = src;
+      });
+      const blobToBase64 = (blob: Blob) => new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || '');
+          const commaIndex = result.indexOf(',');
+          resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+        };
+        reader.onerror = () => reject(reader.error || new Error('blob-to-base64-failed'));
+        reader.readAsDataURL(blob);
+      });
+
+      try {
+        const img = await loadImage(dataUrl);
+        const canvas = document.createElement('canvas');
+        const ctx2d = canvas.getContext('2d');
+        if (!ctx2d) return { ok: false, reason: 'canvas-unavailable' };
+
+        const qualities = [0.92, 0.82, 0.72, 0.62, 0.52, 0.42, 0.32];
+        let scale = 1;
+        let best: any = null;
+        for (let round = 0; round < 8; round++) {
+          const width = Math.max(1, Math.round((img.naturalWidth || img.width) * scale));
+          const height = Math.max(1, Math.round((img.naturalHeight || img.height) * scale));
+          canvas.width = width;
+          canvas.height = height;
+          ctx2d.clearRect(0, 0, width, height);
+          ctx2d.drawImage(img, 0, 0, width, height);
+
+          for (const quality of qualities) {
+            const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+            if (!blob) continue;
+            const encoded = await blobToBase64(blob);
+            const candidate = {
+              size: blob.size,
+              base64: encoded,
+              width,
+              height,
+              quality,
+              mime: 'image/jpeg',
+            };
+            if (!best || candidate.size < best.size) best = candidate;
+            if (blob.size <= maxBytes) {
+              return { ok: true, withinLimit: true, ...candidate };
+            }
+          }
+          scale *= 0.85;
+        }
+
+        if (best) {
+          return { ok: true, withinLimit: best.size <= maxBytes, ...best };
+        }
+        return { ok: false, reason: 'compress-no-result' };
+      } catch (error: any) {
+        return { ok: false, reason: String(error?.message || error || 'compress-error') };
+      }
+    }, {
+      base64: inputBuffer.toString('base64'),
+      inputMime: detectImageMime(inputBuffer),
+      maxBytes,
+    });
+
+    if (!result?.ok || !result?.base64) {
+      if (config.outputLogs) {
+        logger.warn(`[图片压缩] ${tag} 失败`, result);
+      }
+      return null;
+    }
+    const output = Buffer.from(result.base64, 'base64');
+    if (config.outputLogs) {
+      logger.info(`[图片压缩] ${tag}`, {
+        originalBytes: inputBuffer.length,
+        outputBytes: output.length,
+        width: result.width,
+        height: result.height,
+        quality: result.quality,
+        withinLimit: !!result.withinLimit,
+      });
+    }
+    return output;
+  } catch (error) {
+    logger.error(`[图片压缩] ${tag} 异常`, error);
+    return null;
+  } finally {
+    if (page) await page.close().catch(() => { });
+  }
+}
+
+async function prepareImagesForLLM(
+  ctx: Context,
+  imageUrls: string[],
+  config: Config,
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<PreparedImageForLLM[]> {
+  const maxBytes = Math.max(64, config.llmImageInputSizeLimitKB ?? 1024) * 1024;
+  const results: Array<PreparedImageForLLM | null> = new Array(imageUrls.length).fill(null);
+  let cursor = 0;
+  const workerCount = Math.min(3, Math.max(1, imageUrls.length));
+
+  const processOne = async (i: number): Promise<PreparedImageForLLM | null> => {
+    const imageUrl = imageUrls[i];
+    const original = await fetchBinaryWithRetry(ctx, imageUrl, config, 3, 'LLM输入图片', mediaBufferCache);
+    if (!original) {
+      if (config.outputLogs) {
+        logger.warn(`[LLM输入图片] 图片${i + 1} 下载失败，已跳过`, { imageUrl });
+      }
+      return null;
+    }
+
+    let finalBuffer = original;
+    if (original.length > maxBytes) {
+      const compressed = await compressImageToLimit(ctx.puppeteer, original, maxBytes, config, `图片${i + 1}`);
+      if (!compressed) {
+        if (config.outputLogs) {
+          logger.warn(`[LLM输入图片] 图片${i + 1} 压缩失败，已跳过`, {
+            imageUrl,
+            originalBytes: original.length,
+            maxBytes,
+          });
+        }
+        return null;
+      }
+      finalBuffer = compressed;
+    }
+
+    if (finalBuffer.length > maxBytes) {
+      if (config.outputLogs) {
+        logger.warn(`[LLM输入图片] 图片${i + 1} 压缩后仍超限，已跳过`, {
+          imageUrl,
+          finalBytes: finalBuffer.length,
+          maxBytes,
+        });
+      }
+      return null;
+    }
+
+    const mime = detectImageMime(finalBuffer);
+    return {
+      index: i + 1,
+      sourceUrl: imageUrl,
+      originalBytes: original.length,
+      finalBytes: finalBuffer.length,
+      dataUrl: `data:${mime};base64,${finalBuffer.toString('base64')}`,
+    };
+  };
+
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= imageUrls.length) break;
+      results[i] = await processOne(i);
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  const prepared = results.filter(item => !!item) as PreparedImageForLLM[];
+  if (config.outputLogs) {
+    logger.info('[LLM输入图片] 预处理完成', {
+      requestedCount: imageUrls.length,
+      preparedCount: prepared.length,
+      maxBytes,
+      workerCount,
+    });
+  }
+  return prepared;
+}
+
+async function translateImagesInBatches(
+  textOriginal: string,
+  imageUrls: string[],
+  ctx: Context,
+  config: Config,
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<ImageTranslationResult> {
+  if (!isTranslateEnabled(config) || !config.llmImageInputEnabled) return { translated: '', original: '', raw: '' };
+  if (!imageUrls.length) return { translated: '', original: '', raw: '' };
+
+  const prepared = await prepareImagesForLLM(ctx, imageUrls, config, mediaBufferCache);
+  if (!prepared.length) return { translated: '', original: '', raw: '' };
+
+  const batchLimit = Math.max(1, config.llmImageInputLimit ?? 2);
+  const batches = chunkArray(prepared, batchLimit);
+  const basePrompt = fillPromptTemplate(getPromptTemplate(config), toNonEmptyString(textOriginal));
+  const translatedBlocks: string[] = [];
+  let rollingContext = '';
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const imageIndexDesc = batch.map(item => item.index).join('、');
+    const contextChunk = rollingContext ? `前序批次上下文（用于术语统一）：\n${rollingContext.slice(-2500)}\n\n` : '';
+    const instruction = [
+      basePrompt,
+      '',
+      IMAGE_TRANSLATION_PROMPT_APPEND,
+      '',
+      contextChunk,
+      `当前仅处理这些图片序号：${imageIndexDesc}。请严格输出“图片X译文/图片X原文”格式（先译文，后原文）。`,
+    ].join('\n');
+
+    const content = [
+      { type: 'text', text: instruction },
+      ...batch.map(item => ({ type: 'image_url', image_url: { url: item.dataUrl } })),
+    ];
+    const output = await callLLM([{ role: 'user', content }], ctx, config, `图片翻译-批次${i + 1}`);
+    const block = toNonEmptyString(output);
+    if (!block) {
+      if (config.outputLogs) {
+        logger.info(`[图片翻译-批次${i + 1}] 模型返回空内容（通常表示该批图片无可识别文字）`);
+      }
+      continue;
+    }
+    translatedBlocks.push(block);
+    rollingContext = `${rollingContext}\n[第${i + 1}批]\n${block}`.slice(-6000);
+  }
+
+  if (!translatedBlocks.length) {
+    return { translated: '', original: '', raw: '' };
+  }
+  const merged = translatedBlocks.join('\n').trim();
+  return parseImageTranslationResult(merged);
+}
+
+async function buildTweetTranslationBundle(params: BuildTranslationBundleParams): Promise<TweetTranslationBundle> {
+  const { textOriginal, altOriginalList, mediaUrls, mediaBufferCache, ctx, config } = params;
+  const text = toNonEmptyString(textOriginal);
+  const normalizedAlt = (altOriginalList || []).map(item => toNonEmptyString(item)).filter(Boolean);
+  const imageUrls = extractOriginalTweetImageUrlsForLLM(mediaUrls || [], config);
+  const bundle: TweetTranslationBundle = {
+    textOriginal: text,
+    textTranslated: text,
+    altOriginalList: normalizedAlt,
+    altTranslated: '',
+    imageOriginal: '',
+    imageTranslated: '',
+  };
+
+  if (!isTranslateEnabled(config)) {
+    return bundle;
+  }
+
+  const textTranslated = await translateText(text, ctx, config, '正文翻译');
+  if (toNonEmptyString(textTranslated)) {
+    bundle.textTranslated = textTranslated;
+  }
+
+  if (normalizedAlt.length > 0) {
+    const altSource = normalizedAlt.map((alt, i) => `ALT${i + 1}原文：${alt}`).join('\n');
+    const altPrompt = [
+      fillPromptTemplate(getPromptTemplate(config), altSource),
+      '',
+      ALT_TRANSLATION_PROMPT_APPEND,
+    ].join('\n');
+    const altTranslated = await callLLM([{ role: 'user', content: altPrompt }], ctx, config, 'ALT翻译');
+    bundle.altTranslated = toNonEmptyString(altTranslated);
+  }
+
+  if (config.llmImageInputEnabled && imageUrls.length > 0) {
+    const imageResult = await translateImagesInBatches(text, imageUrls, ctx, config, mediaBufferCache);
+    bundle.imageTranslated = imageResult.translated;
+    bundle.imageOriginal = imageResult.original;
+  } else if (config.outputLogs && imageUrls.length > 0) {
+    logger.info('[图片翻译] 未启用 LLM 输入图片支持，跳过图片翻译链路');
+  }
+
+  return bundle;
+}
+
+function buildTweetIntroMessage(params: BuildIntroMessageParams): string {
+  const {
+    heading,
+    messagePrefix,
+    isVideo,
+    bundle,
+    isRetweet,
+    showTranslationSections,
+    bilingualOutput,
+  } = params;
+  const lines: string[] = [];
+  const title = `${heading ? `${heading} ` : ''}${messagePrefix}一条${isVideo ? '视频' : '图片'}推文：`;
+  lines.push(title);
+  if (isRetweet) {
+    lines.push('[提醒：这是一条转发推文]');
+  }
+
+  if (!showTranslationSections) {
+    lines.push(bundle.textOriginal || '（无正文）');
+    if (bundle.altOriginalList.length > 0) {
+      lines.push(...bundle.altOriginalList.map((alt, i) => `ALT${i + 1}原文：${alt}`));
+    }
+    return lines.join('\n');
+  }
+
+  lines.push(bundle.textTranslated || '（无正文）');
+  if (bilingualOutput) {
+    lines.push('[文字原文]');
+    lines.push(bundle.textOriginal || '（无正文）');
+  }
+
+  const imageTranslatedSections = formatImageTranslatedSections(bundle.imageTranslated);
+  if (imageTranslatedSections.length > 0) {
+    lines.push('');
+    lines.push(...imageTranslatedSections);
+  }
+  if (bilingualOutput && bundle.imageOriginal) {
+    lines.push('[图片原文]');
+    lines.push(bundle.imageOriginal);
+  }
+
+  if (bundle.altTranslated) {
+    lines.push('[ALT译文]');
+    lines.push(bundle.altTranslated);
+  }
+  if (bilingualOutput && bundle.altOriginalList.length > 0) {
+    lines.push('[ALT原文]');
+    lines.push(...bundle.altOriginalList.map((alt, i) => `ALT${i + 1}原文：${alt}`));
+  }
+
+  return lines.join('\n');
+}
+
+async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number): Promise<TweetDetailResult> { // 获取需要推送的推文具体内容
   const retryLimit = Math.max(1, Number.isFinite(maxRetries) ? maxRetries : (config.fetchRetries ?? 3));
   let page;
   let attempts = 0;
@@ -429,88 +1422,18 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number) {
       // 设置超时时间
       await page.setDefaultNavigationTimeout(60000);
       await page.setDefaultTimeout(60000);
+      await applyStableScreenshotViewport(page, config);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
       // 等待推文容器渲染
       await page.waitForSelector('article', { timeout: 30000 });
-      // 等待推文内所有图片加载完成
-      await page.evaluate(async () => {
-        const article = document.querySelector('article[data-testid="tweet"]') || document.querySelector('article');
-        if (!article) return;
-        const imgs = Array.from(article.querySelectorAll('img'));
-        await Promise.all(imgs.map(img => {
-          if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-          return new Promise(resolve => {
-            img.onload = img.onerror = resolve;
-          });
-        }));
-      });
       // 检查是否为受保护账号
       const isProtected = await page.evaluate(() => {
         return !!document.querySelector('[aria-label="受保护账号"]');
       });
-
-      // 定位到推文容器进行截图
-      const element = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 });
-      if (!element) {
-        throw new Error('未能找到推文容器');
-      }
-      // Try to wait until images inside the article are complete, then
-      // compute a tight union bbox between the article and a detected avatar image
-      // to avoid expanding too far left (which may include page chrome/sidebar).
-      let screenshotBuffer;
-      try {
-        try {
-          // wait up to 8s for imgs inside the article to finish loading
-          await page.waitForFunction((sel) => {
-            const a = document.querySelector(sel);
-            if (!a) return false;
-            const imgs = Array.from(a.querySelectorAll('img')) as HTMLImageElement[];
-            return imgs.every((img) => img.complete && img.naturalWidth > 0);
-          }, { timeout: 8000 }, 'article[data-testid="tweet"]');
-        } catch (__) {
-          // proceed even if timeout — we'll still try to capture
-        }
-        const box = await element.boundingBox();
-        if (box) {
-          // detect a likely avatar inside the article by finding a small image near the top
-          const imgs = await element.$$('img');
-          let avatarBox = null;
-          for (const img of imgs) {
-            try {
-              const ibox = await img.boundingBox();
-              if (!ibox) continue;
-              const relTop = ibox.y - box.y;
-              // small width and near the top of the article -> likely avatar
-              if (ibox.width <= 96 && relTop >= 0 && relTop <= 96) {
-                avatarBox = ibox;
-                break;
-              }
-            } catch (__) {
-            }
-          }
-          // union bbox
-          let leftMost = box.x;
-          let topMost = box.y;
-          let rightMost = box.x + box.width;
-          let bottomMost = box.y + box.height;
-          if (avatarBox) {
-            leftMost = Math.min(leftMost, avatarBox.x);
-            topMost = Math.min(topMost, avatarBox.y);
-            rightMost = Math.max(rightMost, avatarBox.x + avatarBox.width);
-            bottomMost = Math.max(bottomMost, avatarBox.y + avatarBox.height);
-          }
-          const pad = 12;
-          const x = Math.max(0, Math.floor(leftMost - pad));
-          const y = Math.max(0, Math.floor(topMost - pad));
-          const width = Math.ceil(rightMost - leftMost + pad * 2);
-          const height = Math.ceil(bottomMost - topMost + pad * 2);
-          screenshotBuffer = await page.screenshot({ clip: { x, y, width, height }, type: "webp" });
-        } else {
-          screenshotBuffer = await element.screenshot({ type: "webp" });
-        }
-      } catch (e) {
-        // fallback to element screenshot on any error
-        screenshotBuffer = await element.screenshot({ type: "webp" });
+      const screenshotScene = isProtected ? '受保护推文截图' : '公开推文截图';
+      const screenshotBuffer = await captureTweetScreenshot(page, config, screenshotScene);
+      if (!screenshotBuffer) {
+        throw new Error('未能获取推文截图');
       }
 
       if (isProtected) {
@@ -519,67 +1442,18 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number) {
           const el = document.querySelector('div[data-testid="tweetText"]');
           return el ? el.textContent.trim() : '';
         });
-        const element2 = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 });
-        let screenshotBuffer2 = null;
-        if (element2) {
-          try {
-            try {
-              await page.waitForFunction((sel) => {
-                const a = document.querySelector(sel);
-                if (!a) return false;
-                const imgs = Array.from(a.querySelectorAll('img')) as HTMLImageElement[];
-                return imgs.every((img) => img.complete && img.naturalWidth > 0);
-              }, { timeout: 8000 }, 'article[data-testid="tweet"]');
-            } catch (__) {
-            }
-            const box2 = await element2.boundingBox();
-            if (box2) {
-              const imgs2 = await element2.$$('img');
-              let avatarBox2 = null;
-              for (const img of imgs2) {
-                try {
-                  const ibox = await img.boundingBox();
-                  if (!ibox) continue;
-                  const relTop = ibox.y - box2.y;
-                  if (ibox.width <= 96 && relTop >= 0 && relTop <= 96) {
-                    avatarBox2 = ibox;
-                    break;
-                  }
-                } catch (__) {
-                }
-              }
-              let leftMost2 = box2.x;
-              let topMost2 = box2.y;
-              let rightMost2 = box2.x + box2.width;
-              let bottomMost2 = box2.y + box2.height;
-              if (avatarBox2) {
-                leftMost2 = Math.min(leftMost2, avatarBox2.x);
-                topMost2 = Math.min(topMost2, avatarBox2.y);
-                rightMost2 = Math.max(rightMost2, avatarBox2.x + avatarBox2.width);
-                bottomMost2 = Math.max(bottomMost2, avatarBox2.y + avatarBox2.height);
-              }
-              const pad2 = 12;
-              const x2 = Math.max(0, Math.floor(leftMost2 - pad2));
-              const y2 = Math.max(0, Math.floor(topMost2 - pad2));
-              const width2 = Math.ceil(rightMost2 - leftMost2 + pad2 * 2);
-              const height2 = Math.ceil(bottomMost2 - topMost2 + pad2 * 2);
-              screenshotBuffer2 = await page.screenshot({ clip: { x: x2, y: y2, width: width2, height: height2 }, type: "webp" });
-            } else {
-              screenshotBuffer2 = await element2.screenshot({ type: "webp" });
-            }
-          } catch (err) {
-            screenshotBuffer2 = await element2.screenshot({ type: "webp" });
-          }
-        }
         return {
           word_content: `${word_content}\n（注：此账号为受保护账号，故不提供具体媒体内容）`,
+          altTexts: [],
           mediaUrls: [],
-          screenshotBuffer: screenshotBuffer2
+          screenshotBuffer
         };
       } else {
         // 请求 vxtwitter API
         const apiUrl = url.replace(/(twitter\.com|x\.com)/, 'api.vxtwitter.com');
-        console.log('请求 API URL:', apiUrl);
+        if (config.outputLogs) {
+          logger.info('请求 vxtwitter API URL:', apiUrl);
+        }
         let apiAttempts = 0;
         while (apiAttempts < retryLimit) {
           try {
@@ -588,7 +1462,12 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number) {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
               }
             });
-            console.log('成功接收到 vxtwitter API 的响应:', apiResponse);
+            if (config.outputLogs) {
+              logger.info('成功接收到 vxtwitter API 的响应', {
+                hasText: !!apiResponse?.text,
+                mediaCount: apiResponse?.media_extended?.length || 0,
+              });
+            }
             // 提取图片的 ALT 文本（原始未翻译）
             let altTexts: string[] = [];
             if (apiResponse.media_extended && apiResponse.media_extended.length > 0) {
@@ -596,15 +1475,16 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number) {
                 .filter((m) => m.altText && m.altText.trim())
                 .map((m) => m.altText.trim());
             }
-            // 将 ALT 文本拼接到正文用于翻译
-            let wordContentForTranslation = apiResponse.text || "";
-            if (altTexts.length > 0) {
-              wordContentForTranslation += "\n\n" + altTexts.map((alt, i) => `[图片${altTexts.length > 1 ? (i + 1) : ""}描述: ${alt}]`).join("\n");
-            }
+            const mediaUrls = apiResponse.media_extended ? apiResponse.media_extended.map(m => m.url) : [];
+            const normalizedWordContent = normalizeTweetTextFromApi(
+              apiResponse.text || "",
+              mediaUrls.length,
+              config.outputLogs
+            );
             return {
-              word_content: wordContentForTranslation,
+              word_content: normalizedWordContent,
               altTexts: altTexts,  // 保留原始ALT文本用于显示原文
-              mediaUrls: apiResponse.media_extended ? apiResponse.media_extended.map(m => m.url) : [],
+              mediaUrls: mediaUrls,
               screenshotBuffer
             };
           } catch (err) {
@@ -614,6 +1494,7 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number) {
               // 如果API请求失败，返回空结果
               return {
                 word_content: '',
+                altTexts: [],
                 mediaUrls: [],
                 screenshotBuffer
               };
@@ -629,6 +1510,7 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number) {
         logger.error(`获取推文内容失败，已达最大重试次数。推文链接：${url}`, error);
         return {
           word_content: '',
+          altTexts: [],
           mediaUrls: [],
           screenshotBuffer: null
         };
@@ -779,6 +1661,8 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
           }
           const tweetText = tpTweet.word_content ?? '';
           const mediaUrls = tpTweet.mediaUrls || [];
+          const altTexts = tpTweet.altTexts || [];
+          const mediaBufferCache = new Map<string, Buffer>();
           await ctx.database.upsert('xanalyse', [
             { id, link: latestTweetLink, content: latestTweetcontent },
           ]);
@@ -789,23 +1673,28 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
           const isRetweet = result.tweets[0].isRetweet;
           // 判断是否为视频推文：如果 mediaUrls 中包含 .mp4 则为 true
           const isVideo = mediaUrls.some(url => url.endsWith('.mp4'));
-          // 根据config决定是否翻译推文
-          let tweetWord;
-          if (config.whe_translate === true && config.apiKey) {
-            const translation = await translate(tweetText, ctx, config);
-            console.log('翻译结果', translation);
-            tweetWord = translation;
-          } else {
-            tweetWord = tweetText;
-          }
+          const translationBundle = await buildTweetTranslationBundle({
+            textOriginal: tweetText,
+            altOriginalList: altTexts,
+            mediaUrls,
+            mediaBufferCache,
+            ctx,
+            config,
+          });
 
           // 判断是否命中违禁词
           if (blogger.blacklist && blogger.blacklist.length > 0) {
-            const lowerTweet = tweetWord.toLowerCase();
-            const lowerOriginal = tweetText.toLowerCase();
+            const moderationCorpus = [
+              translationBundle.textTranslated,
+              translationBundle.textOriginal,
+              translationBundle.altTranslated,
+              translationBundle.altOriginalList.join('\n'),
+              translationBundle.imageTranslated,
+              translationBundle.imageOriginal,
+            ].join('\n').toLowerCase();
             const hitWords = blogger.blacklist.filter(word => {
               const lowerWord = word.toLowerCase();
-              return lowerTweet.includes(lowerWord) || lowerOriginal.includes(lowerWord);
+              return moderationCorpus.includes(lowerWord);
             });
             if (hitWords.length > 0) {
               logger.info(`推文包含违禁词：${hitWords.join(', ')}，跳过推送`);
@@ -815,74 +1704,34 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
 
           // 准备botkey
           const botKey = `${config.platform}:${config.account}`;
-          // 构建 ALT 原文显示部分
-          let altOriginalText = "";
-          if (tpTweet.altTexts && tpTweet.altTexts.length > 0) {
-            altOriginalText = "\n" + tpTweet.altTexts.map((alt, i) => `[图片${tpTweet.altTexts.length > 1 ? (i + 1) : ""}描述原文: ${alt}]`).join("\n");
-          }
 
           // 根据是否为视频推文构造不同的消息结构
           if (isVideo) {
             // 视频推文：先发送文字+截图
-            let textMsg = `【${id}】 ${config.messagePrefix}一条视频推文：\n${tweetWord}${altOriginalText}\n`;
-            if (isRetweet) {
-              textMsg += "[提醒：这是一条转发推文]\n";
-            }
+            let textMsg = buildTweetIntroMessage({
+              heading: `【${id}】`,
+              messagePrefix: config.messagePrefix,
+              isVideo: true,
+              bundle: translationBundle,
+              isRetweet,
+              showTranslationSections: isTranslateEnabled(config),
+              bilingualOutput: isBilingualOutput(config),
+            });
+            textMsg += "\n";
             textMsg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}`;
             // 收集图片
             const imageUrls = mediaUrls.filter(url => !url.endsWith('.mp4'));
-            let images: string[] = [];
             if (imageUrls.length > 0) {
-              const imagePromises = imageUrls.map(async (imageUrl) => {
-                let attempts = 0;
-                const maxRetries = 3;
-                while (attempts < maxRetries) {
-                  try {
-                    const response = await ctx.http.get(imageUrl, {
-                      responseType: 'arraybuffer',
-                      headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                      }
-                    });
-                    return h.image(response, 'image/jpeg');
-                  } catch (error) {
-                    attempts++;
-                    logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                    if (attempts >= maxRetries) {
-                      logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                      return null;
-                    }
-                  }
-                }
-              });
-              images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+              const images = await buildImageElementsFromUrls(ctx, imageUrls, config, mediaBufferCache);
               textMsg += `${images.join('\n')}`;
             }
             // 单独发送mp4视频
             const videoUrl = mediaUrls.find(url => url.endsWith('.mp4'));
-            let video_response;
+            let video_response: Buffer | null = null;
             if (videoUrl) {
-              let attempts = 0;
-              const maxRetries = 3;
-              while (attempts < maxRetries) {
-                try {
-                  video_response = await ctx.http.get(videoUrl, {
-                    responseType: 'arraybuffer',
-                    headers: {
-                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    }
-                  });
-                  if (config.outputLogs) {
-                    logger.info(`成功请求视频文件: ${videoUrl}`);
-                  }
-                  break;
-                } catch (error) {
-                  attempts++;
-                  logger.error(`请求视频失败，正在尝试第 ${attempts} 次重试: ${videoUrl}`, error);
-                  if (attempts >= maxRetries) {
-                    logger.error(`请求视频失败，已达最大重试次数: ${videoUrl}`, error);
-                  }
-                }
+              video_response = await fetchBinaryWithRetry(ctx, videoUrl, config, 3, '视频');
+              if (video_response && config.outputLogs) {
+                logger.info(`成功请求视频文件: ${videoUrl}`);
               }
             }
 
@@ -894,35 +1743,19 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
             }
           } else {
             // 图片推文
-            let msg = `【${id}】 ${config.messagePrefix}一条图片推文：\n${tweetWord}${altOriginalText}\n`;
-            if (isRetweet) {
-              msg += "[提醒：这是一条转发推文]\n";
-            }
+            let msg = buildTweetIntroMessage({
+              heading: `【${id}】`,
+              messagePrefix: config.messagePrefix,
+              isVideo: false,
+              bundle: translationBundle,
+              isRetweet,
+              showTranslationSections: isTranslateEnabled(config),
+              bilingualOutput: isBilingualOutput(config),
+            });
+            msg += "\n";
             msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
             if (mediaUrls.length > 0) {
-              const imagePromises = mediaUrls.map(async (imageUrl) => {
-                let attempts = 0;
-                const maxRetries = 3;
-                while (attempts < maxRetries) {
-                  try {
-                    const response = await ctx.http.get(imageUrl, {
-                      responseType: 'arraybuffer',
-                      headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                      }
-                    });
-                    return h.image(response, 'image/jpeg');
-                  } catch (error) {
-                    attempts++;
-                    logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
-                    if (attempts >= maxRetries) {
-                      logger.error(`请求图片失败，已达最大重试次数: ${imageUrl}`, error);
-                      return null;
-                    }
-                  }
-                }
-              });
-              const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+              const images = await buildImageElementsFromUrls(ctx, mediaUrls, config, mediaBufferCache);
               msg += `${images.join('\n')}`;
             }
             for (const groupId of groupID) {
@@ -936,7 +1769,6 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
         }
       } catch (error) {
         logger.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl}`, error);
-        console.error(`加载博主 ${id} 的页面时出错，URL: ${bloggerUrl}`, error);
         if (session?.send) {
           await session.send(`加载博主 ${id} 的页面时出错，可能是网络问题或链接不合法。请检查链接的合法性或稍后重试。`);
         }
@@ -944,7 +1776,6 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
     }
   } catch (error) {
     logger.error('主函数错误：', error);
-    console.error('主函数错误：', error);
     if (session?.send) {
       await session.send('获取推文时出错，请检查网页链接的合法性或稍后重试。');
     }
@@ -1004,43 +1835,4 @@ async function getTimeNow() {// 获得当前时间
   });
   const formattedDate = formatter.format(now);
   return formattedDate
-}
-
-async function translate(text: string, ctx, config) { // 翻译推文
-  const url = config.apiurl + '/chat/completions';
-  const model = config.model
-  const promptTemplate = (config.prompt && config.prompt.trim()) ? config.prompt : DEFAULT_PROMPT;
-  const headers = {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${config.apiKey}`,
-  };
-  const data = {
-    model: model,
-    messages: [
-      // { role: 'system', content: "你是一个翻译助手" },
-      { role: 'user', content: promptTemplate.replace('{text}', text) },
-    ],
-    stream: false,
-  };
-  const retryLimit = Math.max(1, config.translateRetries ?? 3);
-  let attempts = 0;
-  while (attempts < retryLimit) {
-    try {
-      const response = await ctx.http.post(url, data, { headers });
-      if (config.outputLogs) {
-        logger.info('翻译api返回结果：', response);
-      }
-      console.log('翻译结果：', response.choices[0].message.content);
-      const translation = response.choices[0].message.content;
-      return translation;
-    } catch (err) {
-      attempts++;
-      logger.error(`翻译失败，正在尝试第 ${attempts} 次重试...`, err);
-      if (attempts >= retryLimit) {
-        logger.error('翻译失败，请检查api余额或检查api是否配置正确：', err);
-        return '翻译失败，请检查api余额或检查api是否配置正确';
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
-    }
-  }
 }

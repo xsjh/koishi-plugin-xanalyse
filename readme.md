@@ -8,7 +8,7 @@
 <p>数据来源于 <a href="https://x.com" target="_blank">x.com</a></p>
 <hr>
 <h2>Tutorials</h2>
-<h3> ⭐️推文翻译功能需要前往<a href="https://platform.deepseek.com/usage" target="_blank">deepseek开放平台</a>申请API Keys并充值⭐️</h3>
+<h3> ⭐️推文翻译功能需要配置可用的 API Key，并确保对应服务账户可正常调用⭐️</h3>
 <h4>指令介绍：</h4>
 <p><b>twitter</b></p>
 <ul>
@@ -39,6 +39,49 @@
 <hr>
 <div class="version">
 <h3>Version</h3>
+<p>1.4.2</p>
+<p><b>功能更新</b></p>
+<ul>
+<li>新增配置项：<code>screenshotHighQualityMode</code>（高质量模式，开启后截图使用 <code>deviceScaleFactor=2</code>）</li>
+<li>优化截图链路：固定截图 viewport（<code>1280x2200</code>，<code>deviceScaleFactor=1</code>），统一滚动定位与布局稳定检测流程</li>
+<li>优化截图抗干扰能力：截图前临时隐藏高风险 <code>fixed/sticky</code> 浮层并冻结动画，截图后自动恢复页面状态</li>
+<li>优化配置页说明：Version 区块精简为“更新记录请参考顶部插件主页”</li>
+</ul>
+<p><b>修复说明</b></p>
+<ul>
+<li>修复推文截图偶发区域偏移、错位的问题</li>
+<li>修复推文截图偶发白色画面的问题</li>
+<li>缓解截图中偶发黑色圆点等浮层干扰问题</li>
+</ul>
+<p>1.4.1</p>
+<p><b>功能更新</b></p>
+<ul>
+<li>新增配置项：<code>screenshotExtraWaitMs</code>（截图前额外等待时间，毫秒）</li>
+<li>优化图片译文展示：多图场景下每个图片译文块之间增加空行</li>
+</ul>
+<p><b>修复说明</b></p>
+<ul>
+<li>修复图片无文字时，图片译文可能误复用正文译文的问题</li>
+<li>修复图片译文字段解析兼容性问题（支持 <code>图片译文</code> / <code>图片1译文</code> / <code>[图片译文]</code> / <code>[图片1译文]</code> 等格式）</li>
+<li>修复无有效图片译文时仍可能出现图片译文空段落的问题</li>
+</ul>
+<p>1.4.0</p>
+<p><b>功能更新</b></p>
+<ul>
+<li>新增 LLM 图片输入翻译链路（可选启用），支持正文/图片/ALT 联合处理</li>
+<li>新增配置项：<code>llmImageInputEnabled</code>、<code>llmImageInputLimit</code>、<code>llmImageInputSizeLimitKB</code></li>
+<li>新增配置项：<code>translationBilingual</code>（双语/仅译文显示开关）</li>
+<li>优化图片处理链路：图片超限自动压缩，超出数量分批翻译并保留批次上下文</li>
+<li>优化图片翻译展示：单图显示 <code>[图片译文]</code>，多图显示 <code>[图片1译文]</code>、<code>[图片2译文]</code> 等</li>
+<li>优化链接检测防重：跳过手动 <code>twitter</code> 命令触发的二次自动处理，并对同消息重复链接去重</li>
+<li>优化媒体处理性能与兼容性：按真实 MIME 发送图片，同一推文内复用媒体缓存，图片预处理改为小并发（保序）</li>
+</ul>
+<p><b>修复说明</b></p>
+<ul>
+<li>修复媒体推文仅含 <code>t.co</code> 占位链接时被误显示为正文的问题</li>
+<li>修复图片无文字场景下可能输出空图片翻译字段的问题</li>
+<li>修复图片翻译在模型返回非标准格式时可能丢失有效结果的问题（增加解析兜底）</li>
+</ul>
 <p>1.3.1</p>
 <p><b>功能更新</b></p>
 <ul>
