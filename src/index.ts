@@ -1,11 +1,13 @@
 import { Context, Schema, h, Logger } from 'koishi'
 import { } from "koishi-plugin-puppeteer";
+import type { ChatLunaChatModel } from 'koishi-plugin-chatluna/lib/llm-core/platform/model'
+import type { ComputedRef } from 'koishi-plugin-chatluna'
 
 export const name = 'xanalyse'
 
 export const logger = new Logger('xanalyse');
 
-export const inject = { required: ["puppeteer", "database"] };
+export const inject = { required: ["puppeteer", "database", "chatluna"] };
 
 export const usage = `
 <h1>X推送</h1>
@@ -19,51 +21,7 @@ export const usage = `
 <p>数据来源于 <a href="https://x.com" target="_blank">x.com</a></p>
 <hr>
 <h2>Tutorials</h2>
-<h3> ⭐️推文翻译功能需要前往<a href="https://platform.deepseek.com/usage" target="_blank">deepseek开放平台</a>申请API Keys并充值⭐️</h3>
-<h4>指令介绍：</h4>
-<p><b>twitter</b></p>
-<ul>
-<p> · 输入<code>twitter 推特帖子链接</code>即可获取此帖子的截图和以及翻译的内容和具体图片</p>
-<p>例：twitter https://x.com/tim_cook/status/1914665497565798835</p>
-</ul>
-<p><b>tt:</b></p>
-<ul>
-<p> · 发送<code>tt</code>后会自动检查一遍当前订阅的博主的最新推文</p>
-<br>
-</ul>
 <p><b>📢注意：在填写完博主用户名后若初始化失败，请打开日志调试模式，手动点击生成的博主链接，查看是否正确引导至博主页面。若有误则可能因为博主id填写有误</b></p>
-<hr>
-<h3>Notice</h3>
-<ul>
-<p> · 刚启动此插件的时候会初始化获取一遍订阅博主的最新推文并存入数据库，然后才会开始监听更新的推文</p>
-<p> · 翻译功能支持任意兼容 OpenAI API 格式的第三方服务，只需在配置中修改 <code>apiurl</code> 和 <code>model</code> 即可使用</p>
-</ul>
-
-<h4>Link Detection</h4>
-<ul>
-<p> · 新增配置项 <code>detectXLinks</code>（默认：<code>true</code>），用于启用或禁用插件对 X/Twitter 链接的自动检测。</p>
-<p> · 当启用时，插件会在收到含有 <code>x.com</code>、<code>twitter.com</code> 或短链 <code>t.co</code> 的消息时进行识别并尝试展开短链；若 <code>outputLogs</code> 为 <code>true</code>，插件还会在会话中发送一条简短提示（否则仅写入日志）。</p>
-<p> · 若聊天中链接较多或担心性能影响，可将 <code>detectXLinks</code> 设为 <code>false</code> 以关闭该检测。</p>
-</ul>
-
-<p><b>再次提醒：全程需✨🧙‍♂️，请在proxy-agent内配置代理</b></p>
-<hr>
-<div class="version">
-<h3>Version</h3>
-<p>1.3.0</p>
-<ul>
-<li>新增 X/Twitter 链接自动检测功能，可识别并自动处理消息中的推文链接</li>
-<li>新增图片 ALT 文本提取功能，自动获取推文图片的描述文字</li>
-<li>新增可配置消息前缀选项 <code>messagePrefix</code></li>
-<li>优化推文截图逻辑，改进头像区域检测</li>
-<li>调整图片描述原文显示位置至推文正文之后</li>
-<li>手动查询命令现支持翻译功能</li>
-</ul>
-<p>1.2.0</p>
-<ul>
-<li>增加了违禁词识别功能</li>
-</ul>
-</div>
 <hr>
 <h2>⚠！重要告示！⚠</h2>
 <p><b>本插件开发初衷是为了方便在群内看女声优推特，切勿用于订阅推送不合规、不健康内容，一切后果自负！</b></p>
@@ -82,8 +40,6 @@ export interface Config {
   messagePrefix: string;
   fetchRetries: number;
   whe_translate?: boolean;
-  apiKey?: string;
-  apiurl?: string;
   model?: string;
   prompt?: string;
   translateRetries?: number;
@@ -107,15 +63,13 @@ export const Config = Schema.intersect([
   }).description('基础设置'),
 
   Schema.object({
-    whe_translate: Schema.boolean().default(false).description('是否启用推文翻译（接入deepseek v3）')
+    whe_translate: Schema.boolean().default(false).description('是否启用推文翻译（通过 ChatLuna 调用大模型）')
   }).description('翻译设置'),
 
   Schema.union([
     Schema.object({
       whe_translate: Schema.const(true).required(),
-      apiKey: Schema.string().required().description('deepseek apiKey密钥<br>点此链接了解👉https://platform.deepseek.com/api_keys'),
-      apiurl: Schema.string().default('https://api.deepseek.com').description('默认为ds官方api接口，支持任意 OpenAI 兼容格式的第三方服务'),
-      model: Schema.string().default('deepseek-chat').description('默认为ds官方模型，可根据使用的API服务自行修改'),
+      model: Schema.dynamic('model').description('使用的的大语言模型名称 (需要通过 ChatLuna 先配置好)'),
       prompt: Schema.string().role('textarea').default(DEFAULT_PROMPT).description('翻译使用的提示词，使用{text}表示需要翻译的文本'),
       translateRetries: Schema.number().min(1).default(3).description('翻译接口失败时的重试次数')
     }),
@@ -136,12 +90,15 @@ export const Config = Schema.intersect([
     outputLogs: Schema.boolean().default(true).description('日志调试模式，开启以获得更多信息').experimental(),
     detectXLinks: Schema.boolean().default(true).description('是否启用 X/Twitter 链接检测，检测到时会根据 outputLogs 回复或记录日志')
   }).description('调试设置'),
-]) as Schema<Config>;
+]) as unknown as Schema<Config>;
 
 //声明数据表
 declare module 'koishi' {
   interface Tables {
     xanalyse: Xanalyse
+  }
+  interface Context {
+    chatluna: any
   }
 }
 //表的接口类型
@@ -157,7 +114,26 @@ export interface LatestResult {
 
 
 
-export async function apply(ctx: Context, config, session) {
+export async function apply(ctx: Context, config: Config, session) {
+  let chatLunaModel: ComputedRef<ChatLunaChatModel>;
+
+  const loadModel = async () => {
+    try {
+      if (config.whe_translate && config.model) {
+        chatLunaModel = await ctx.chatluna.createChatModel(config.model);
+      }
+    } catch (e) {
+      logger.error('加载 ChatLuna 模型时出错：', e);
+    }
+  };
+
+  const schemaPath = 'koishi-plugin-chatluna/utils/schema';
+  const { modelSchema } = await import(schemaPath as any);
+  modelSchema(ctx);
+  ctx.on('ready', async () => {
+    await loadModel();
+  });
+
   // 创建数据库
   try {
     ctx.database.extend('xanalyse', {
@@ -174,7 +150,7 @@ export async function apply(ctx: Context, config, session) {
   await init(config, ctx);
 
   // 定时推送
-  ctx.setInterval(async () => { checkTweets(session, config, ctx) }, config.updateInterval * 60 * 1000);
+  ctx.setInterval(async () => { checkTweets(session, config, ctx, chatLunaModel) }, config.updateInterval * 60 * 1000);
 
   // 可复用的处理函数：根据 url 获取推文截图/翻译并通过 session 发送结果
   async function processTwitterUrl(sessionParam, urlParam) {
@@ -206,9 +182,9 @@ export async function apply(ctx: Context, config, session) {
       }
       // 根据config决定是否翻译推文
       let tweetWord;
-      if (config.whe_translate === true && config.apiKey) {
+      if (config.whe_translate === true && config.model) {
         try {
-          const translation_result = await translate(tweetText, ctx, config);
+          const translation_result = await translate(tweetText, ctx, config, chatLunaModel);
           if (config.outputLogs) {
             logger.info("手动查询翻译结果：", translation_result);
           }
@@ -323,21 +299,16 @@ export async function apply(ctx: Context, config, session) {
     }
   }
 
-  ctx.command('tt', '主动检查一次推文更新')
-    .action(async ({ session }) => {
-      await session.send("正在检查更新...");
-      await checkTweets(session, config, ctx);
-    });
-
-  ctx.command('cs', '测试，开发专用')
-    .action(async ({ session }) => {
-      await session.send("正在测试...");
-    });
-
-  ctx.command('twitter [...arg]', '根据url获得twitter推文截图')
+  ctx.command('x [...arg]', '根据url获得推文信息')
     .action(async ({ session }, ...arg) => {
       const url = arg.join(' ').trim();
       await processTwitterUrl(session, url);
+    });
+
+  ctx.command('x/flash', '主动检查一次推文更新')
+    .action(async ({ session }) => {
+      await session.send("正在检查更新...");
+      await checkTweets(session, config, ctx, chatLunaModel);
     });
 
   // X/Twitter 链接识别：提取消息中的 URL，识别 x/twitter 域名，并尝试展开 t.co 短链。
@@ -729,7 +700,7 @@ async function getLatestTweets(pptr, url, config, maxRetries?: number): Promise<
   }
 }
 
-async function checkTweets(session, config, ctx) { // 更新一次推文
+async function checkTweets(session, config, ctx, chatLunaModel?: ComputedRef<ChatLunaChatModel>) { // 更新一次推文
   try {
     const baseUrl = 'https://x.com';
     for (const blogger of config.bloggers) {
@@ -791,8 +762,8 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
           const isVideo = mediaUrls.some(url => url.endsWith('.mp4'));
           // 根据config决定是否翻译推文
           let tweetWord;
-          if (config.whe_translate === true && config.apiKey) {
-            const translation = await translate(tweetText, ctx, config);
+          if (config.whe_translate === true && config.model) {
+            const translation = await translate(tweetText, ctx, config, chatLunaModel);
             console.log('翻译结果', translation);
             tweetWord = translation;
           } else {
@@ -1006,39 +977,37 @@ async function getTimeNow() {// 获得当前时间
   return formattedDate
 }
 
-async function translate(text: string, ctx, config) { // 翻译推文
-  const url = config.apiurl + '/chat/completions';
-  const model = config.model
+async function translate(text: string, ctx, config, chatLunaModel?: ComputedRef<ChatLunaChatModel>) { // 翻译推文
+  const { HumanMessage } = await import('@langchain/core/messages');
   const promptTemplate = (config.prompt && config.prompt.trim()) ? config.prompt : DEFAULT_PROMPT;
-  const headers = {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${config.apiKey}`,
-  };
-  const data = {
-    model: model,
-    messages: [
-      // { role: 'system', content: "你是一个翻译助手" },
-      { role: 'user', content: promptTemplate.replace('{text}', text) },
-    ],
-    stream: false,
-  };
   const retryLimit = Math.max(1, config.translateRetries ?? 3);
   let attempts = 0;
   while (attempts < retryLimit) {
     try {
-      const response = await ctx.http.post(url, data, { headers });
+      if (!chatLunaModel || !chatLunaModel.value) {
+        throw new Error('ChatLuna 聊天模型未加载完成或不可用');
+      }
+      const response = await chatLunaModel.value.invoke([
+        new HumanMessage(promptTemplate.replace('{text}', text))
+      ]);
       if (config.outputLogs) {
         logger.info('翻译api返回结果：', response);
       }
-      console.log('翻译结果：', response.choices[0].message.content);
-      const translation = response.choices[0].message.content;
-      return translation;
+      if (response && response.content) {
+        const translation = typeof response.content === 'string'
+          ? response.content
+          : JSON.stringify(response.content);
+        console.log('翻译结果：', translation);
+        return translation;
+      } else {
+        throw new Error('模型未返回任何内容');
+      }
     } catch (err) {
       attempts++;
       logger.error(`翻译失败，正在尝试第 ${attempts} 次重试...`, err);
       if (attempts >= retryLimit) {
-        logger.error('翻译失败，请检查api余额或检查api是否配置正确：', err);
-        return '翻译失败，请检查api余额或检查api是否配置正确';
+        logger.error('翻译失败，请检查 ChatLuna 配置是否正确：', err);
+        return '翻译失败，请检查 ChatLuna 配置是否正确';
       }
       await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
     }
